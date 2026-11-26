@@ -4,7 +4,6 @@ import { FloatingMenu } from './FloatingMenu';
 import { Icon } from './ui';
 import { artifactIcon, artifactLabel, safePreviewUrl, type PreviewArtifact } from '../lib/artifacts';
 import { api } from '../lib/client';
-import { openExternal } from '../lib/open-external';
 export function ArtifactCard({ artifact: a, onPreview }: {
     artifact: PreviewArtifact;
     onPreview: (a: PreviewArtifact) => void;
@@ -18,7 +17,8 @@ export function ArtifactCard({ artifact: a, onPreview }: {
         setMenu(false);
         setError('');
         if (!canReveal && url && action === 'open') {
-            void openExternal(url);
+            // The app window has no handler for a new window, so window.open does nothing there: the host opens the address in the default browser (#4721).
+            api.post('/api/artifacts/open', { action: 'open', url }).catch(() => { window.open(url, '_blank', 'noopener,noreferrer'); });
             return;
         }
         setBusy(true);
