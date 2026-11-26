@@ -876,6 +876,9 @@ class StrataEngine:
         self._franken_sup = None
         if isinstance(cfg, dict) and isinstance(cfg.get("franken"), dict) and cfg["franken"].get("enabled", True):
             # Opt-in FrankenStrata mixed-hardware agent supervision for `serve`: untouched unless "franken" is in config.
+            repo_root = str(ROOT.parent)
+            if repo_root not in sys.path:
+                sys.path.insert(0, repo_root)
             from franken.launcher.franken_launch import (
                 AgentLaunchSpec, AgentSupervisor, LaunchPlan, build_primary_franken_args,
             )

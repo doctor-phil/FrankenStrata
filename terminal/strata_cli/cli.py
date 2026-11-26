@@ -2207,6 +2207,9 @@ def _run(a: argparse.Namespace) -> int:
         if a.command == "repair-access":
             return _repair_access(a)
         if a.command == "franken":
+            repo_root = str(ROOT.parent)
+            if repo_root not in sys.path:
+                sys.path.insert(0, repo_root)
             from franken.launcher.franken_launch import main as franken_main
             return franken_main(list(getattr(a, "franken_args", []) or []))
         if a.command == "profile":
@@ -2334,6 +2337,12 @@ def main(argv: list[str] | None = None) -> int:
         pass
     ap = parser()
     raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "franken":
+        repo_root = str(ROOT.parent)
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from franken.launcher.franken_launch import main as franken_main
+        return franken_main(raw[1:])
     a, extras = ap.parse_known_args(_install_argv(raw))
     a.raw_argv = raw
     if extras:

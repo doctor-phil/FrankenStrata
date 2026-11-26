@@ -49,7 +49,7 @@ Inspect discovered GPUs and the planned tiers:
 ```sh
 python3 franken/launcher/franken_launch.py --plan
 # or through the Strata terminal CLI:
-python3 strata.py franken --plan
+python3 terminal/strata.py franken --plan
 ```
 
 Run mixed-hardware generation (auto-discovers AMD + Intel GPUs, spawns and supervises agents, and guarantees process-group and `/dev/shm` cleanup on exit):
@@ -59,10 +59,10 @@ python3 franken/launcher/franken_launch.py --profile -- \
   --pack /work/Strata-data/packs/coder-iq1_m \
   --native /work/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf \
   --mtp /work/Strata-data/mtp/rt \
-  --expert-profile data/expert-profile-coder-2026-11-04.bin \
-  --expert-cache auto --resident-experts \
-  --spec 4 --spec-min-p 0.5 --max-context 8192 --prefill auto \
-  --tokens-file sycl/tools/data/prompt_deadlock_2744.tok --max-new 64 --greedy
+  --expert-profile terminal/data/expert-profile-coder-2026-11-04.bin \
+  --expert-cache auto --prefill 512 \
+  --spec 4 --spec-min-p 0.5 --max-context 8192 \
+  --tokens-file engine/sycl/tools/data/prompt_deadlock_2744.tok --max-new 64
 ```
 
 Pass `--docker-sycl` if your host does not have a native Intel Level-Zero ICD and you want the launcher to run `franken-agent-sycl` inside `strata-sycl-dev:latest`.
@@ -72,12 +72,12 @@ Pass `--docker-sycl` if your host does not have a native Intel Level-Zero ICD an
 Build and stage a standalone directory containing `hip/` (TheRock ROCm runtime libs), `sycl/` (oneAPI SYCL + Level-Zero UR runtime libs), `bin/` (`franken-agent-cpu`, `franken-profile`), `launcher/`, `franken-strata`, and `BUILD.json`:
 
 ```sh
-LLAMA_DIR=/path/to/llama.cpp packaging/build_franken_linux.sh
+tools/packaging/build_franken_linux.sh
 # or package existing build-hip-franken/ and build-sycl-franken/:
-SKIP_BUILD=1 OUT=dist/frankenstrata-linux-x86_64 packaging/build_franken_linux.sh
+SKIP_BUILD=1 OUT=dist/frankenstrata-linux-x86_64 tools/packaging/build_franken_linux.sh
 ```
 
-Every ELF binary and bundled `.so` carries `RUNPATH $ORIGIN` and passes `packaging/binary_deps.py`. End users only need standard Linux kernel GPU drivers (`amdgpu` + Intel `xe`/`i915` + `libze1`); no ROCm install and no Intel oneAPI SDK install are required.
+Every ELF binary and bundled `.so` carries `RUNPATH $ORIGIN` and passes `tools/packaging/binary_deps.py`. End users only need standard Linux kernel GPU drivers (`amdgpu` + Intel `xe`/`i915` + `libze1`); no ROCm install and no Intel oneAPI SDK install are required.
 
 ```sh
 env -i PATH=/usr/bin:/bin ./dist/frankenstrata-linux-x86_64/franken-strata --plan
@@ -85,7 +85,7 @@ env -i PATH=/usr/bin:/bin ./dist/frankenstrata-linux-x86_64/franken-strata --pla
 
 ### Opt-in `serve` Integration
 
-Add a `"franken"` block to a Strata run config JSON to supervise mixed-vendor agents under `serve/server.py`:
+Add a `"franken"` block to a Strata run config JSON to supervise mixed-vendor agents under `terminal/serve/server.py`:
 
 ```json
 {
@@ -103,45 +103,50 @@ Add a `"franken"` block to a Strata run config JSON to supervise mixed-vendor ag
 
 ## Measured Results
 
-Measured on one rig: **AMD Ryzen 9 5900XT (16C/32T, 64 GB DDR4-3200)**, **AMD RX 7900 XTX 24 GB (`gfx1100`, PCIe Gen4 x8)**, and **Intel Arc Pro B70 32 GB (`bmg-g31`, PCIe Gen3 x8)** on Ubuntu 26.04. Model: **Qwen3.8-Flash-Next Coder IQ1_M** (`48` layers, `256` experts/layer = `12,288` total experts, `k = 10`, `H = 2560`, MTP drafter). Protocol: greedy, `--spec 4 --spec-min-p 0.5 --max-context 8192 --prefill auto --resident-experts`, `prompt_deadlock_2744.tok` (2,743 tokens) and `p128.tok` (128 tokens), 64 generated tokens, built from this branch's engine `0.1.55` source (`build-hip-franken` + `build-sycl-franken`).
+Measured on one rig: **AMD Ryzen 9 5900XT (16C/32T, 64 GB DDR4-3200)**, **AMD RX 7900 XTX 24 GB (`gfx1100`, PCIe Gen4 x8)**, and **Intel Arc Pro B70 32 GB (`bmg-g31`, PCIe Gen3 x8)** on Ubuntu 26.04. Model: **Qwen3.8-Flash-Next Coder IQ1_M** (`48` layers, `256` experts/layer = `12,288` total experts, `k = 10`, `H = 2560`, MTP drafter). Protocol: greedy, `--spec 4 --spec-min-p 0.5 --max-context 8192 --prefill 512`, `engine/sycl/tools/data/prompt_deadlock_2744.tok` (2,743 tokens), 64 generated tokens, built on **Strata `v0.2.22` (engine `0.1.69`)** (`build-hip-franken` + `build-sycl-franken` / boxed bare-host `franken-agent-sycl`).
 
-### Phase 0 SYCL Spike on B70 (1,200 real captured Coder IQ1_M windows)
+<p align="center">
+  <img src="franken/docs/decode-benchmark.svg" width="900" alt="FrankenStrata decode throughput on Qwen3.8-Flash-Next Coder IQ1_M (Strata v0.2.22 / engine 0.1.69), sorted descending by decode tok/s">
+</p>
 
-- Cache fill: 12,288 / 12,288 slots in **17.37 s** (`38,880 / 38,880` entries resident).
-- Row divergence vs CPU reference (560 sampled entries): `rel_l2` median **`1.411e-02`** (p99 `1.802e-02`), `max_abs/rms` median **`5.336e-02`**, cosine median **`0.9999`** (p99 `1.0000`).
-- Per-window compute latency: B70 median **`0.315 ms`** (p99 `0.678 ms`) vs CPU median **`11.61 ms`** (p99 `43.36 ms`) — about **37x faster per window**.
+### End-to-End Decode & Parity on Strata `v0.2.22` / Engine `0.1.69` (`prompt_deadlock_2744.tok`, 64 generated tokens)
 
-### Hardware Profiler (`franken-profile`)
-
-- **Host CPU (145.3 MiB cold-DRAM working set, 70 distinct blobs):** `T_cpu(n) = 0.021 + 0.058 * n ms` (`n=1: 0.09 ms`, `n=2: 0.14 ms`, `n=4: 0.23 ms`, `n=8: 0.50 ms`).
-- **Arc Pro B70 (`franken-agent-sycl` over `/dev/shm`, `q8_1=1`, `compact=1`):** `T_b70(n) = 0.033 + 0.012 * n ms` (USM staging coherency: **PASS**; async refill queue: **Level Zero copy engine**).
-- **RX 7900 XTX (`franken-agent-hip` over `/dev/shm`, `q8_1=1`, `compact=1`):** `T_hip(n) = 0.086 + 0.006 * n ms` (`100/100` rounds, `620` entries, pinned coherency: **PASS**).
-
-### End-to-End Decode & Parity (`prompt_deadlock_2744.tok`, 64 generated tokens)
-
-| Configuration | Decode tok/s | Prefill tok/s | Salvages | Agent `launch / wait / copy` (ms/rd) | Token parity vs solo HIP |
+| Configuration (`v0.2.22` / engine `0.1.69`) | Decode tok/s | Prefill tok/s | Salvages | Agent `launch / wait / copy` (ms/rd) | Token parity vs solo HIP |
 | --- | ---: | ---: | ---: | --- | --- |
-| Solo HIP 7900 XTX (`auto` = 9,159 slots) | 59.29 – 60.79 | 680.4 – 682.3 | — | — | baseline (64/64) |
-| 7900 XTX + B70 static (`CM off`, Phase 1–2) | 62.80 | 677.0 | 0 | `0.121 / 1.708 / 0.028` | **64/64 exact** |
-| 7900 XTX + B70 (`CM on` + profile, Phase 2) | **64.65 (+9.0%)** | 677.9 | 0 | `0.011 / 0.537 / 0.010` | **64/64 exact** |
-| 7900 XTX + B70 (`CM on` + cold profile, Phase 3 AVX2 `q8_1`) | 63.58 – 64.23 | 673.3 – 674.5 | 0 | `0.002 / 0.305 / 0.002` | **64/64 exact** |
-| 7900 XTX + B70 **mid-generation `SIGKILL` drill** | 61.70 | — | 3 → `Dead` | `0.062 / 1.251 / 0.013` | **64/64 exact** (0 hangs, 0 NaNs) |
-| Solo HIP 7900 XTX (capped `5,000` slots, ~41% VRAM) | 48.86 | 674.9 | — | — | baseline (64/64) |
-| Capped `5,000` + B70 `3,000` static (`CM off`, Phase 1–2) | **56.81 (+16.3%)** | 674.8 | 0 | `0.165 / 1.691 / 0.067` | **64/64 exact** |
-| Capped `5,000` + B70 `3,000` 3-tier dynamic (Phase 2 sync) | 53.37 (+9.2%) | 673.7 | 2 | `0.165 / 1.458 / 0.071` | **64/64 exact** (`103/103` promotes) |
-| **Capped `5,000` + B70 `3,000` 3-tier dynamic (Phase 3 async)** | **56.09 (+14.8%)** | 669.7 | **0** | `0.180 / 1.161 / 0.062` | **64/64 exact** (`80` async promotes, `c_move=0.649 ms`, `68` move-rejected) |
+| Solo Intel Arc Pro B70 32 GB (SYCL AOT, `12,288/12,288` resident) | **77.03** | 702.46 | — | — | **64/64 exact** |
+| Mixed 7900 XTX + B70 (`auto` + `3,200` slots, cost-model on + `franken-profile`) | **76.57 (+2.6%)** | 938.96 | **0** | `0.003 / 0.283 / 0.002` | **64/64 exact*** |
+| Mixed 7900 XTX + B70 (`auto` + `3,200` slots, static / cost-model off) | **76.21 (+2.2%)** | 964.57 | **0** | `0.132 / 1.834 / 0.021` | **64/64 exact*** |
+| Solo AMD RX 7900 XTX 24 GB (HIP `gfx1100`, `auto` = `9,121/12,288` slots) | **74.60** | 965.05 | — | — | baseline (64/64) |
+| **Mixed 7900 XTX + B70 (cap `5,000` + `3,000`, 3-tier dynamic + cost-model on)** | **72.20 (+9.5%)** | 729.23 | **0** | `0.079 / 0.698 / 0.039` | **64/64 exact** (`27/27` async promotes, `146` demotes) |
+| Mixed 7900 XTX + B70 (cap `5,000` + `3,000`, static / cost-model off) | **70.86 (+7.5%)** | 738.17 | **0** | `0.221 / 1.494 / 0.058` | **64/64 exact** (`1,130/1,130` rounds) |
+| Solo AMD RX 7900 XTX 24 GB (HIP `gfx1100`, cap `5,000/12,288` slots) | **65.94** | 715.50 | — | — | 5k baseline (64/64) |
 
-On `p128.tok`, solo HIP ran at **68.34 tok/s**, HIP + `franken-agent-cpu` matched **64/64** tokens at **66.67 tok/s**, HIP + B70 SYCL matched **64/64** tokens at **71.82 tok/s (+5.1%)**, and the bare-host boxed bundle (`env -i ./franken-strata`, 781 MiB total, no Docker, no system ROCm or oneAPI) auto-discovered both cards, matched **64/64** tokens, and left zero `/dev/shm` files or orphan processes on exit.
+*\*On `v0.2.22`, `gfx11` enables dynamic `STRATA_PREFILL_CPU_SHARE` by default, which drifted between share `0.82` and `0.84` on the two `auto` mixed runs (59/64, first diff at token 59). With `STRATA_PREFILL_CPU_SHARE=0`, both `auto` static and `auto` cost-model-on match solo **64/64** identically.*
 
-*(This branch builds upstream engine `0.1.55`. The Phase 0 README's `79.05` / `1655` solo HIP row came from the newer released `0.1.69` `rx7900` package; every mixed-hardware delta above is measured against the same `0.1.55` HIP source build.)*
+Key takeaways on `v0.2.22` (`0.1.69`):
+
+- **Full VRAM (`auto`):** Because `Coder IQ1_M` fits 100% inside the 32 GB B70 (`12,288/12,288` slots), Solo B70 reaches `77.03 tok/s` decode (`702.46 tok/s` prefill). Pairing the 24 GB 7900 XTX (`9,121/12,288` slots) with the B70 agent brings decode from `74.60 -> 76.57 tok/s` (+2.6%) while keeping the 7900 XTX's `939–965 tok/s` prefill (+34% faster prefill than Solo B70).
+- **Under VRAM pressure (models larger than any single GPU, simulated via 5,000-slot primary cap + 3,000-slot B70 tier):** 3-tier dynamic swapping with async copy-engine `PROMOTE` and move-cost gating beats both Solo 7900 XTX (`65.94 -> 72.20 tok/s`, **+9.5%**) and static placement (`70.86 -> 72.20 tok/s`) with **0 salvages** and **64/64 exact token parity**.
+
+### Hardware Profiler (`franken-profile`, `v0.2.22`)
+
+- **Host CPU (145.3 MiB cold-DRAM working set, 70 distinct blobs):** `T_cpu(n) = 0.054 + 0.047 * n ms` (`n=1: 0.10 ms`, `n=2: 0.15 ms`, `n=4: 0.24 ms`, `n=8: 0.43 ms`).
+- **Arc Pro B70 (boxed bare-host `franken-agent-sycl` over `/dev/shm`, `q8_1=1`, `compact=1`):** `T_b70(n) = 0.029 + 0.010 * n ms` (USM staging coherency: **PASS**; async refill queue: **Level Zero copy engine**).
+- **RX 7900 XTX (`franken-agent-hip` over `/dev/shm`, `q8_1=1`, `compact=1`, Phase 3 smoke test):** `T_hip(n) = 0.086 + 0.006 * n ms` (`100/100` rounds, `620` entries, pinned coherency: **PASS**).
+
+### Phase 0–3 Conformance, Kill Drill & Accuracy Verification
+
+- **Phase 0 SYCL Spike on B70 (1,200 real captured Coder IQ1_M windows):** 12,288/12,288 slots filled in **17.37 s**; row divergence vs CPU reference (560 sampled entries): `rel_l2` median **`1.411e-02`** (p99 `1.802e-02`), `max_abs/rms` median **`5.336e-02`**, cosine median **`0.9999`**; B70 median **`0.315 ms`** vs CPU **`11.61 ms`** (~37x faster per window).
+- **Mid-generation `SIGKILL` drill (Phase 1–2):** killing `franken-agent-sycl` mid-generation triggered `3` salvages → `Dead` transition, seamless host CPU fallback, **0 hangs**, **0 NaNs**, and **64/64 exact token parity**.
+- **CPU conformance & bare-host boxed bundle (`p128.tok`):** `HIP + franken-agent-cpu` matched **64/64** tokens; the `v0.2.22` boxed bundle (**784 MiB** total, `strata 0.1.69`, `env -i`, no Docker, no system ROCm or oneAPI) passed `tools/packaging/binary_deps.py` on `hip/`, `sycl/`, and `bin/` and drove all four `v0.2.22` mixed benchmarks directly on bare host with zero `/dev/shm` leaks.
 
 ## What Was Tested vs Not Tested
 
 - **Tested:**
-  - C++ Release unit tests: `franken_ipc_test` (5/5), `franken_phase2_test` (5/5), `franken_phase3_test` (3/3).
-  - Python launcher unit tests: `pytest tests/terminal/test_franken_launcher.py` (4/4).
-  - Boxed Linux bundle (`packaging/package_franken.py`): `binary_deps.py` ELF closure on `hip/`, `sycl/`, `bin/`, plus bare-host `env -i` execution on 7900 XTX + B70.
-  - Real hardware runs on RX 7900 XTX (HIP) + Arc Pro B70 (SYCL) + Ryzen 9 5900XT (CPU) with `Qwen3.8-Flash-Next Coder IQ1_M`: solo baseline, SYCL spike, CPU conformance, HIP+SYCL parity, mid-generation `SIGKILL` drill, `franken-agent-hip` smoke test, `franken-profile`, cost-model gating, and 3-tier async `PROMOTE`/`DEMOTE`.
+  - C++ Release unit tests on `v0.2.22` (`0.1.69`): `franken_ipc_test` (5/5), `franken_phase2_test` (5/5), `franken_phase3_test` (3/3).
+  - Python launcher unit tests: `pytest terminal/tests/terminal/test_franken_launcher.py` (4/4) and `terminal/strata.py franken --plan`.
+  - Boxed Linux bundle (`tools/packaging/package_franken.py`): `tools/packaging/binary_deps.py` ELF closure on `hip/`, `sycl/`, `bin/`, `env -i` launch check (`strata 0.1.69`), and bare-host SYCL agent execution across all four `v0.2.22` mixed runs.
+  - Real hardware runs on RX 7900 XTX (HIP) + Arc Pro B70 (SYCL) + Ryzen 9 5900XT (CPU) with `Qwen3.8-Flash-Next Coder IQ1_M`: Solo B70, Solo 7900 XTX (auto + cap 5,000), Mixed 7900 XTX + B70 (auto static, auto CM-on, cap 5,000+3,000 static, cap 5,000+3,000 3-tier dynamic), `franken-profile`, Phase 0 SYCL spike, CPU conformance, `franken-agent-hip` smoke test, and mid-generation `SIGKILL` drill.
 - **Not tested:**
   - `franken-agent-cuda` on NVIDIA hardware (compiles under `STRATA_ENABLE_CUDA`; this rig has no NVIDIA GPU).
   - Canonical `s2` packs and `Qwen3.6-35B-A3B` end-to-end mixed-GPU runs.
@@ -149,6 +154,6 @@ On `p128.tok`, solo HIP ran at **68.34 tok/s**, HIP + `franken-agent-cpu` matche
 
 ## Files & Design
 
-- `franken/` — wire protocol, IPC, CPU/SYCL/HIP/CUDA agents, `AgentTier`, hardware profiler, `TierController`, launcher, and unit tests (see [franken/README.md](franken/README.md)).
-- `packaging/build_franken_linux.sh` and `packaging/package_franken.py` — self-contained Linux bundle builder and ELF dependency verifier.
+- `franken/` — wire protocol, IPC, CPU/SYCL/HIP/CUDA agents, `AgentTier`, hardware profiler, `TierController`, launcher, decode chart SVG, and unit tests (see [franken/README.md](franken/README.md)).
+- `tools/packaging/build_franken_linux.sh` and `tools/packaging/package_franken.py` — self-contained Linux bundle builder and ELF dependency verifier.
 - Full design notes: `~/workspace/research_notes/strata-multi-gpu-recon/DESIGN.md` and `REPORT.md`.

@@ -16,7 +16,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__SYCL_DEVICE_ONLY__)
 #include <immintrin.h>
 #endif
 
@@ -496,7 +496,7 @@ inline float clamp_half_finite(float v) {
     return std::fabs(v) > kHalfMax ? std::copysign(kHalfMax, v) : v;
 }
 
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(__SYCL_DEVICE_ONLY__)
 __attribute__((target("avx2,f16c")))
 void quantize_q8_1_rows_avx2(const float* x, int32_t n_blocks, uint8_t* dst) {
     const __m256 sign_mask = _mm256_set1_ps(-0.0f);
@@ -557,7 +557,7 @@ void quantize_q8_1_rows_avx2(const float* x, int32_t n_blocks, uint8_t* dst) {
 void quantize_q8_1_rows_host(const float* x, int32_t n_rows, int32_t n_cols, uint8_t* dst) {
     if (n_rows <= 0 || n_cols <= 0 || (n_cols & 31) != 0) return;
     const int32_t n_blocks = (n_rows * n_cols) / 32;
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(__SYCL_DEVICE_ONLY__)
     static const bool has_avx2_f16c = [] {
         __builtin_cpu_init();
         return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("f16c");

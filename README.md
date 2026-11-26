@@ -25,7 +25,27 @@
 
 **Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
 
-> **FrankenStrata fork (mixed-vendor multi-GPU on Linux):** This fork adds process-per-vendor expert tiering over POSIX shared memory so GPUs from different vendors work together on one MoE model — verified on an **AMD RX 7900 XTX (24 GB, HIP) + Intel Arc Pro B70 (32 GB, SYCL)** rig with `Qwen3.8-Flash-Next Coder IQ1_M` (**64/64 exact token parity**, up to **+9.0%** decode at full VRAM and **+16.3%** / **+14.8%** dynamic 3-tier speedup when primary VRAM is capped, plus zero-hang `SIGKILL` CPU fallback). Stock single-vendor Strata behavior is unchanged unless `--franken-agent` or `franken-strata` is used. See **[FRANKENSTRATA.md](FRANKENSTRATA.md)** for architecture, quick start, boxed packaging, and measured benchmarks.
+## FrankenStrata (Mixed-Vendor Multi-GPU on Linux)
+
+FrankenStrata extends Strata (`v0.2.22`, engine `0.1.69`) with process-per-vendor expert tiering over POSIX shared memory (`/dev/shm`) and non-private Linux futexes so GPUs from different vendors work together on one MoE model. Stock single-vendor Strata behavior stays unchanged unless `--franken-agent` or `franken-strata` is used.
+
+<p align="center">
+  <img src="franken/docs/decode-benchmark.svg" width="900" alt="FrankenStrata decode throughput on Qwen3.8-Flash-Next Coder IQ1_M (Strata v0.2.22 / engine 0.1.69), sorted descending by decode tok/s">
+</p>
+
+Measured on an **AMD Ryzen 9 5900XT (64 GB DDR4)** + **AMD RX 7900 XTX 24 GB (`gfx1100`, HIP)** + **Intel Arc Pro B70 32 GB (`bmg-g31`, SYCL AOT)** running `Qwen3.8-Flash-Next Coder IQ1_M` (`prompt_deadlock_2744.tok`, 2,743 tokens, greedy, `--spec 4 --spec-min-p 0.5 --max-context 8192 --prefill 512`, 64 generated tokens):
+
+| Configuration (`v0.2.22` / engine `0.1.69`) | Decode tok/s | Prefill tok/s | Delta vs Solo 7900 XTX | Salvages |
+| --- | ---: | ---: | ---: | ---: |
+| Solo Intel Arc Pro B70 32 GB (SYCL AOT, `12,288/12,288` resident) | **77.03** | 702.46 | — | — |
+| Mixed 7900 XTX + B70 (`auto` + 3,200 slots, cost-model on + `franken-profile`) | **76.57** | 938.96 | **+2.6%** vs auto | 0 |
+| Mixed 7900 XTX + B70 (`auto` + 3,200 slots, static / cost-model off) | **76.21** | 964.57 | **+2.2%** vs auto | 0 |
+| Solo AMD RX 7900 XTX 24 GB (HIP, `auto` = `9,121/12,288` slots) | **74.60** | 965.05 | baseline (auto) | — |
+| Mixed 7900 XTX + B70 (cap `5,000` + `3,000` slots, 3-tier dynamic + cost-model on) | **72.20** | 729.23 | **+9.5%** vs 5k cap | 0 |
+| Mixed 7900 XTX + B70 (cap `5,000` + `3,000` slots, static / cost-model off) | **70.86** | 738.17 | **+7.5%** vs 5k cap | 0 |
+| Solo AMD RX 7900 XTX 24 GB (HIP, cap `5,000/12,288` slots) | **65.94** | 715.50 | baseline (5k cap) | — |
+
+All capped and deterministic (`STRATA_PREFILL_CPU_SHARE=0`) mixed configurations match solo **64/64** tokens identically, and mid-generation `SIGKILL` of the SYCL agent falls back cleanly to host CPU with zero hangs or NaNs. See **[FRANKENSTRATA.md](FRANKENSTRATA.md)** for full architecture, profiler, dynamic controller, boxed Linux packaging, and usage.
 
 ## Models
 

@@ -144,7 +144,7 @@ def _stage_sycl(
         rel_bin = agent_bin.resolve().relative_to(REPO_ROOT.resolve())
         inner = (
             f"set -euo pipefail; "
-            f"python3 /src/packaging/collect_libs.py "
+            f"python3 /src/tools/packaging/collect_libs.py "
             f"--binary /src/{rel_bin.as_posix()} "
             f"--search /opt/intel/oneapi/compiler/latest/lib "
             f"--search /opt/intel/oneapi/mkl/latest/lib "
@@ -206,7 +206,7 @@ def _git_commit() -> str:
 
 
 def _project_version() -> str:
-    txt = (REPO_ROOT / "CMakeLists.txt").read_text(encoding="utf-8", errors="ignore")
+    txt = (REPO_ROOT / "engine" / "CMakeLists.txt").read_text(encoding="utf-8", errors="ignore")
     for line in txt.splitlines():
         if line.strip().startswith("project(strata VERSION "):
             parts = line.split()
