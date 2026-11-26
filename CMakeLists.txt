@@ -407,6 +407,29 @@ target_link_libraries(strata_plan INTERFACE strata_warnings)
 add_executable(strata-plan src/plan/plan_main.cpp)
 target_link_libraries(strata-plan PRIVATE strata_plan)
 
+# ---- FrankenStrata IPC layer & GPU-less tests (Linux POSIX shm + futex) ----
+if(UNIX AND NOT APPLE)
+  find_package(Threads REQUIRED)
+  add_library(franken_ipc STATIC franken/wire/franken_ipc.cpp
+                                 franken/profiler/hw_profile.cpp
+                                 franken/primary/agent_tier.cpp
+                                 franken/control/tier_controller.cpp)
+  target_include_directories(franken_ipc PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(franken_ipc PUBLIC Threads::Threads rt strata_warnings)
+  add_executable(franken_ipc_test franken/tests/franken_ipc_test.cpp)
+  target_link_libraries(franken_ipc_test PRIVATE franken_ipc)
+  add_executable(franken_phase2_test franken/tests/franken_phase2_test.cpp
+                                     franken/agent/agent_loop.cpp)
+  target_link_libraries(franken_phase2_test PRIVATE franken_ipc)
+  if(STRATA_BUILD_TESTS)
+    enable_testing()
+    add_test(NAME franken_ipc_test COMMAND franken_ipc_test)
+    set_tests_properties(franken_ipc_test PROPERTIES TIMEOUT 60)
+    add_test(NAME franken_phase2_test COMMAND franken_phase2_test)
+    set_tests_properties(franken_phase2_test PROPERTIES TIMEOUT 60)
+  endif()
+endif()
+
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
@@ -688,6 +711,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  if(UNIX AND NOT APPLE)
+    target_link_libraries(strata_engine PUBLIC franken_ipc)
+  endif()
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
     add_executable(host_graph_launch_test tests/core/host_graph_launch_test.cu)
     target_include_directories(host_graph_launch_test PRIVATE include)
@@ -2791,4 +2817,12 @@ if(STRATA_BUILD_DSV41 AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND N
     target_link_libraries(ds4_gg_bench PRIVATE strata_kernels_cpu Threads::Threads)
     target_compile_definitions(ds4_gg_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
   endif()
+endif()
+
+# ---- FrankenStrata vendor-free reference CPU agent & hardware profiler (no GPU dependency) ---
+if(UNIX AND NOT APPLE)
+  add_executable(franken-agent-cpu franken/agent/franken_agent_cpu.cpp franken/agent/agent_loop.cpp)
+  target_link_libraries(franken-agent-cpu PRIVATE franken_ipc strata_kernels_cpu)
+  add_executable(franken-profile franken/profiler/franken_profile.cpp)
+  target_link_libraries(franken-profile PRIVATE franken_ipc strata_kernels_cpu)
 endif()

@@ -42,6 +42,12 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
+#if defined(__linux__)
+#include "franken/control/tier_controller.hpp"
+#include "franken/primary/agent_tier.hpp"
+#include "franken/profiler/hw_profile.hpp"
+#include "franken/wire/pack_identity.hpp"
+#endif
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
@@ -695,6 +701,13 @@ struct Options {
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
     int64_t peer_prefill_rows = -1;
+    /// FrankenStrata: opt-in foreign-vendor agent tiers (--franken-agent <shm>[,slots=N], repeatable).
+    std::vector<std::string> franken_agents;
+    double franken_deadline_ms = 0.0;
+    std::string franken_capture_windows;
+    std::string franken_profile;
+    int franken_adapt_swaps = -1;     ///< -1 = follow adapt_swaps, 0 = static agent residency
+    bool franken_cost_model = true;   ///< --franken-cost-model on|off (only active with --franken-agent)
     /// The PLE gather's prefetch, as an A/B arm.  The gather measured 2.10-2.61 ms/token because its sixteen
     /// row reads are sixteen SEPARATE page faults into a 26.8 GB mapping; see `ple_prefetch_enable`.
     bool no_ple_prefetch = false;
@@ -1078,6 +1091,15 @@ void usage() {
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
                  "  --cvec-mode add|project  h += s v (default) or h -= s (h.v) v with v unit\n"
+                 "  --franken-agent SHM[,slots=N]  FrankenStrata: connect a foreign-vendor expert agent over POSIX shm\n"
+                 "                       (repeatable for 1..N agents; default off)\n"
+                 "  --franken-deadline-ms MS  FrankenStrata: override per-layer agent salvage deadline in ms\n"
+                 "                       (default 0 = adaptive max(2 ms, 8 x rolling p95))\n"
+                 "  --franken-profile FILE  FrankenStrata: load franken-hw-profile.json to seed controller latency priors\n"
+                 "  --franken-adapt-swaps N  FrankenStrata: max dynamic PROMOTE/DEMOTE swaps per agent per adapt round\n"
+                 "                       (default -1 = match --adapt-swaps; 0 = static agent residency)\n"
+                 "  --franken-cost-model on|off  FrankenStrata: online latency cost-model dispatch gating (default on)\n"
+                 "  --franken-capture-windows FILE  FrankenStrata: capture real FRKW verify windows for agent_spike\n"
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
@@ -1250,6 +1272,8 @@ struct Drive {
     /// needs no locking.  `d.layers` is the CURRENT layer on entry (the adapter increments it as it walks the
     /// blob), which is why the layer index comes from there rather than from a counter of our own.
     std::FILE* routing = nullptr;
+    std::FILE* window_capture = nullptr;
+    int32_t window_capture_embd = 0;
 };
 
 void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
@@ -1302,6 +1326,12 @@ void drive_pool_multi_impl(void* user, const float* x_f, const int32_t* ids, int
             static const float one[64] = {};   // k <= 64 in a verify window; zeros read as unit weights
             std::fwrite(one, sizeof(float), (size_t) k, t->routing);
         }
+    }
+    if (t->window_capture != nullptr && layer >= 0) {
+        const uint32_t hdr[2] = {(uint32_t) layer, (uint32_t) n_tok};
+        std::fwrite(hdr, sizeof(uint32_t), 2, t->window_capture);
+        std::fwrite(ids, sizeof(int32_t), (size_t) (n_tok * k), t->window_capture);
+        std::fwrite(x_f, sizeof(float), (size_t) (n_tok * t->window_capture_embd), t->window_capture);
     }
 }
 
@@ -3332,6 +3362,20 @@ int main(int argc, char** argv) {
         else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots"));
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
         else if (a == "--peer-prefill-rows") o.peer_prefill_rows = std::atoll(next("--peer-prefill-rows"));
+        else if (a == "--franken-agent") o.franken_agents.push_back(next("--franken-agent"));
+        else if (a == "--franken-deadline-ms") o.franken_deadline_ms = std::atof(next("--franken-deadline-ms"));
+        else if (a == "--franken-profile") o.franken_profile = next("--franken-profile");
+        else if (a == "--franken-adapt-swaps") o.franken_adapt_swaps = std::atoi(next("--franken-adapt-swaps"));
+        else if (a == "--franken-cost-model") {
+            const std::string v = next("--franken-cost-model");
+            if (v == "on" || v == "1" || v == "true") o.franken_cost_model = true;
+            else if (v == "off" || v == "0" || v == "false") o.franken_cost_model = false;
+            else {
+                std::fprintf(stderr, "strata generate: --franken-cost-model expects on or off (got '%s')\n", v.c_str());
+                return 2;
+            }
+        }
+        else if (a == "--franken-capture-windows") o.franken_capture_windows = next("--franken-capture-windows");
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--expert-profile-save") o.expert_profile_save = next("--expert-profile-save");
@@ -7708,6 +7752,10 @@ int main(int argc, char** argv) {
     }
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+#if defined(__linux__)
+    std::vector<std::unique_ptr<franken::primary::AgentTier>> franken_tiers;
+    franken::control::TierController franken_ctrl;
+#endif
     Drive drive;
     // #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tiers leave an expert a helper GPU holds out of the primary's
     // promotion candidates (it would sit in both caches).  Asked live, from the helper's own cache (RemoteExperts::holds,
@@ -7722,6 +7770,70 @@ int main(int argc, char** argv) {
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
         drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
     drive.d.peer = peer.valid() ? &peer : nullptr;
+#if defined(__linux__)
+    if (!o.franken_agents.empty()) {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        franken::wire::PackIdentity pack_id{};
+        if (!franken::ipc::compute_pack_identity(o.pack, o.native_preset, lay, pack_id, err)) {
+            std::fprintf(stderr, "strata generate: franken pack identity: %s\n", err.c_str());
+            return 1;
+        }
+        franken::wire::Geometry fg{};
+        fg.n_layers = (int32_t) g.n_layers;
+        fg.n_expert = (int32_t) g.n_expert;
+        fg.k = (int32_t) K;
+        fg.n_embd = (int32_t) g.n_embd;
+        fg.max_tokens = franken::wire::kDefaultMaxTokens;
+        fg.max_entries = franken::wire::kDefaultMaxEntries;
+        fg.pack = pack_id;
+        std::vector<uint64_t> fblobs((size_t) g.n_layers, 0);
+        for (int64_t l = 0; l < g.n_layers; ++l) fblobs[(size_t) l] = lay.blob_bytes(l);
+
+        std::vector<uint8_t> claimed((size_t) (g.n_layers * g.n_expert), 0);
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                const size_t idx = (size_t) (l * g.n_expert + e);
+                if (xcache.valid() && xcache.slot_of(l, e) >= 0) claimed[idx] = 1;
+                if (peer.valid() && peer.has(l, e)) claimed[idx] = 1;
+                for (int r = 0; r < drive.d.remote_count; ++r)
+                    if (drive.d.remote[r]->holds(l, (int32_t) e)) claimed[idx] = 1;
+            }
+        }
+        for (const std::string& raw_spec : o.franken_agents) {
+            franken::primary::AgentSpec spec{};
+            if (!franken::primary::parse_agent_spec(raw_spec, spec, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 2;
+            }
+            auto tier = std::make_unique<franken::primary::AgentTier>();
+            if (!tier->open(spec, fg, fblobs, profile, claimed, o.franken_deadline_ms,
+                            /*hello_timeout_ms=*/60000, /*open_timeout_ms=*/180000, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            drive.d.franken_agents.push_back(tier.get());
+            franken_tiers.push_back(std::move(tier));
+        }
+        const int32_t agent_swaps = o.franken_adapt_swaps >= 0 ? o.franken_adapt_swaps : std::max(0, o.adapt_swaps);
+        franken_ctrl.init((int32_t) g.n_layers, (int32_t) g.n_expert, drive.d.franken_agents,
+                          o.franken_cost_model, agent_swaps);
+        if (!o.franken_profile.empty()) {
+            franken::profiler::HwProfile hwp{};
+            if (!franken::profiler::load_hw_profile(o.franken_profile, hwp, err)) {
+                std::fprintf(stderr, "strata generate: --franken-profile %s: %s\n",
+                             o.franken_profile.c_str(), err.c_str());
+                return 1;
+            }
+            franken_ctrl.seed_from_profile(hwp);
+        }
+        drive.d.franken_controller = &franken_ctrl;
+    }
+#else
+    if (!o.franken_agents.empty()) {
+        std::fprintf(stderr, "strata generate: --franken-agent is currently supported on Linux only\n");
+        return 2;
+    }
+#endif
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
     drive.d.split_rows = !o.no_split_rows;
     drive.d.pool = &pool;
@@ -7865,6 +7977,20 @@ int main(int argc, char** argv) {
             return 1;
         }
         drive.routing = routing;
+    }
+    std::FILE* window_capture = nullptr;
+    if (!o.franken_capture_windows.empty()) {
+        window_capture = std::fopen(o.franken_capture_windows.c_str(), "wb");
+        if (window_capture == nullptr) {
+            std::fprintf(stderr, "strata generate: cannot write %s\n", o.franken_capture_windows.c_str());
+            return 1;
+        }
+        const char magic[4] = {'F', 'R', 'K', 'W'};
+        const uint32_t hdr[5] = {1u, (uint32_t) g.n_layers, (uint32_t) g.n_expert, (uint32_t) K, (uint32_t) g.n_embd};
+        std::fwrite(magic, 1, 4, window_capture);
+        std::fwrite(hdr, sizeof(uint32_t), 5, window_capture);
+        drive.window_capture = window_capture;
+        drive.window_capture_embd = (int32_t) g.n_embd;
     }
     strata::core::PoolFn pool_fn = o.no_pool ? nullptr : &drive_pool;
     // The hit hook rides the same switch as the pool: with no pool there is no `parts` staging to
@@ -11321,6 +11447,9 @@ int main(int argc, char** argv) {
         };
         auto apply_pending = [&](bool wait) {
             if (peer.valid()) peer.apply_pending(wait);
+#if defined(__linux__)
+            if (drive.d.franken_controller != nullptr) drive.d.franken_controller->poll_acks();
+#endif
             if (pending.empty()) return;
             if (wait) cudaEventSynchronize(adapt_ev);
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
@@ -11611,6 +11740,18 @@ int main(int argc, char** argv) {
                     return false;
                 }
             }
+#if defined(__linux__)
+            if (drive.d.franken_controller != nullptr) {
+                std::vector<std::pair<int32_t, int32_t>> adopted, evicted;
+                adopted.reserve(swaps.size());
+                evicted.reserve(swaps.size());
+                for (const Swap& s : swaps) {
+                    adopted.emplace_back(s.layer, s.in);
+                    evicted.emplace_back(s.layer, s.out);
+                }
+                drive.d.franken_controller->on_adapt_round(drive.d.usage, host_res, adopted, evicted);
+            }
+#endif
             for (float& v : drive.d.usage) v *= o.adapt_decay;
             return true;
         };
@@ -18228,6 +18369,9 @@ int main(int argc, char** argv) {
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
         int64_t adapt_rounds = 0;   // counted here: `rounds` is declared below the adapt lambda
         auto apply_pending = [&](bool wait) {
+#if defined(__linux__)
+            if (drive.d.franken_controller != nullptr) drive.d.franken_controller->poll_acks();
+#endif
             if (pending.empty()) return;
             // STRATA_TRACE_ADAPT=1: whether a round's copies had landed when the next window read the table
             static const bool trace_pending = std::getenv("STRATA_TRACE_ADAPT") != nullptr;
@@ -18353,6 +18497,18 @@ int main(int argc, char** argv) {
             if (trace_adapt)
                 std::fprintf(stderr, "strata: ADAPT round=%lld swapped %zu of %d slots, usage decayed\n",
                              (long long) adapt_rounds, swaps.size(), o.adapt_swaps);
+#if defined(__linux__)
+            if (drive.d.franken_controller != nullptr) {
+                std::vector<std::pair<int32_t, int32_t>> adopted, evicted;
+                adopted.reserve(swaps.size());
+                evicted.reserve(swaps.size());
+                for (const Swap& s : swaps) {
+                    adopted.emplace_back(s.layer, s.in);
+                    evicted.emplace_back(s.layer, s.out);
+                }
+                drive.d.franken_controller->on_adapt_round(drive.d.usage, host_res, adopted, evicted);
+            }
+#endif
             for (float& v : drive.d.usage) v *= o.adapt_decay;
             swaps_total += (int64_t) swaps.size();
             ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
@@ -18801,6 +18957,41 @@ int main(int argc, char** argv) {
             std::printf("%-24s plan %.3f  activation quantize %.3f  jobs %.3f  run %.3f ms/round\n", "dispatch",
                         drive.d.ms_plan / rounds, drive.d.ms_actq / rounds, drive.d.ms_jobs / rounds,
                         drive.d.ms_run / rounds);
+#if defined(__linux__)
+        if (!franken_tiers.empty()) {
+            for (size_t ai = 0; ai < franken_tiers.size(); ++ai) {
+                const auto& ag = franken_tiers[ai];
+                const auto& am = franken_ctrl.agent_model(ai);
+                std::printf("%-24s [%s/%s] state=%s resident=%lld entries=%llu rounds=%llu/%llu salvaged=%llu "
+                            "promotes=%llu/%llu demotes=%llu launch=%.3f wait=%.3f copy=%.3f ms/round "
+                            "fit=%.3f+%.3f*n ms\n",
+                            "franken agent", ag->shm_name().c_str(), ag->vendor_str(),
+                            ag->alive() ? "Ready" : "Dead",
+                            (long long) ag->resident(),
+                            (unsigned long long) ag->entries_served(),
+                            (unsigned long long) ag->rounds_done(),
+                            (unsigned long long) ag->rounds_launched(),
+                            (unsigned long long) ag->rounds_salvaged(),
+                            (unsigned long long) ag->promotes_acked(),
+                            (unsigned long long) ag->promotes_sent(),
+                            (unsigned long long) ag->demotes_sent(),
+                            rounds > 0 ? ag->ms_launch() / rounds : 0.0,
+                            rounds > 0 ? ag->ms_wait() / rounds : 0.0,
+                            rounds > 0 ? ag->ms_copy() / rounds : 0.0,
+                            am.a, am.b);
+            }
+            std::printf("%-24s cost_model=%s gated=%llu rounds (%llu entries) adapt_rounds=%llu "
+                        "dedup=%llu cascade=%llu miss_promotes=%llu cpu_fit=%.3f+%.3f*n ms\n",
+                        "franken control", franken_ctrl.cost_model_enabled() ? "on" : "off",
+                        (unsigned long long) franken_ctrl.gated_rounds(),
+                        (unsigned long long) franken_ctrl.gated_entries(),
+                        (unsigned long long) franken_ctrl.adapt_rounds(),
+                        (unsigned long long) franken_ctrl.dedup_demotes(),
+                        (unsigned long long) franken_ctrl.cascade_promotes(),
+                        (unsigned long long) franken_ctrl.miss_promotes(),
+                        franken_ctrl.cpu_model().a, franken_ctrl.cpu_model().b);
+        }
+#endif
         if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
                         (long long) swaps_total, o.adapt_every, ms_adapt / rounds);
@@ -18884,6 +19075,11 @@ int main(int argc, char** argv) {
         drive.routing = nullptr;
         std::printf("%-24s %s (%lld records of layer, k, ids, weights)\n", "routing dumped",
                     o.dump_routing.c_str(), (long long) drive.calls);
+    }
+    if (window_capture != nullptr) {
+        std::fclose(window_capture);
+        drive.window_capture = nullptr;
+        std::printf("%-24s %s\n", "windows captured", o.franken_capture_windows.c_str());
     }
     if (o.stage_timing) strata::core::stage_timing_report(g.n_layers);
 

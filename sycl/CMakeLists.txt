@@ -250,6 +250,15 @@ add_library(strata_kernels STATIC ${_kernels})
 target_include_directories(strata_kernels PRIVATE ${STRATA_ROOT}/third_party/ggml)
 target_link_libraries(strata_kernels PUBLIC strata_core)
 
+if(UNIX AND NOT APPLE)
+  add_library(franken_ipc STATIC ${STRATA_ROOT}/franken/wire/franken_ipc.cpp
+                                 ${STRATA_ROOT}/franken/profiler/hw_profile.cpp
+                                 ${STRATA_ROOT}/franken/primary/agent_tier.cpp
+                                 ${STRATA_ROOT}/franken/control/tier_controller.cpp)
+  target_include_directories(franken_ipc PUBLIC ${STRATA_ROOT})
+  target_link_libraries(franken_ipc PUBLIC Threads::Threads rt)
+endif()
+
 strata_resolve(_engine src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
                        src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp
                        src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
@@ -261,6 +270,9 @@ add_library(strata_engine STATIC ${_engine} ${CMAKE_CURRENT_SOURCE_DIR}/src/core
             ${CMAKE_CURRENT_SOURCE_DIR}/src/core/copy_queue.cpp)   # 0.1.43: a queue on the copy engine
 target_include_directories(strata_engine PRIVATE ${STRATA_ROOT}/src/core)   # conversation_checked.hpp (#include "...")
 target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu)
+if(UNIX AND NOT APPLE)
+  target_link_libraries(strata_engine PUBLIC franken_ipc)
+endif()
 
 # cuBLAS -> oneMKL through dpct::blas (needs the MKL SYCL BLAS domain)
 strata_resolve(_prefill src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
@@ -275,6 +287,20 @@ target_link_libraries(strata_prefill PUBLIC strata_engine)
 strata_resolve(_main src/program/generate.cpp)
 add_executable(strata ${_main})
 target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
+
+# --- FrankenStrata: Phase 0 SYCL spike + Phase 1 SYCL agent -------------------------------------------------------
+add_executable(franken-agent-spike ${STRATA_ROOT}/franken/agent/agent_spike.cpp)
+target_compile_definitions(franken-agent-spike PRIVATE STRATA_FRANKEN_SYCL_SPIKE=1)
+target_include_directories(franken-agent-spike PRIVATE ${STRATA_ROOT})
+target_link_libraries(franken-agent-spike PRIVATE strata_engine strata_kernels strata_kernels_cpu)
+
+if(UNIX AND NOT APPLE)
+  add_executable(franken-agent-sycl ${STRATA_ROOT}/franken/agent/franken_agent_sycl.cpp
+                                    ${STRATA_ROOT}/franken/agent/agent_loop.cpp)
+  target_link_libraries(franken-agent-sycl PRIVATE franken_ipc strata_engine strata_kernels strata_kernels_cpu)
+  add_executable(franken-profile ${STRATA_ROOT}/franken/profiler/franken_profile.cpp)
+  target_link_libraries(franken-profile PRIVATE franken_ipc strata_kernels_cpu)
+endif()
 
 # --- the kernel parity self-tests (each runs on the card and compares against a CPU reference) ---------------------
 option(STRATA_SYCL_PARITY "Build the kernel parity tests" ON)

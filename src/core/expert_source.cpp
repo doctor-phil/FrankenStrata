@@ -6,6 +6,10 @@
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
+#if defined(__linux__)
+#include "franken/primary/agent_tier.hpp"
+#include "franken/control/tier_controller.hpp"
+#endif
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/window_limits.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -4735,7 +4739,9 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 
     // Clause 1: rebuilt from `x_f` on EVERY call.  `x_f` is mapped pinned memory whose address never changes,
     // so anything cached against it would be layer 0's activation reused 48 times.
+    bool act_quantized = false;
     act_quant_q8_1(x_f, H, d.act);
+    act_quantized = true;
 
     // ---- R4.2c: THE POOL'S HALF OF THE SPLIT.  **IT DOES NOT DECIDE ANYTHING - `Launch` ALREADY DID.**
     //
@@ -4765,6 +4771,46 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
             }
     }
 
+#if defined(__linux__)
+    int32_t franken_owner[32];
+    const bool use_franken = !d.franken_agents.empty() && k <= 32;
+    if (use_franken) {
+        for (int64_t i = 0; i < k; ++i) franken_owner[i] = -1;
+        for (int64_t i = 0; i < k; ++i) {
+            const int64_t e = ids[i];
+            if (e < 0 || e >= d.n_expert) continue;
+            const bool is_vram_hit = use_hits && (graph_hits
+                ? d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0
+                : d.is_hit[(size_t) i] != 0);
+            if (is_vram_hit) continue;
+            bool remote_owns = false;
+            for (int r = 0; r < d.remote_count; ++r) remote_owns |= d.remote[r]->owns(i);
+            if (remote_owns) continue;
+            for (size_t a = 0; a < d.franken_agents.size(); ++a) {
+                auto* ag = d.franken_agents[a];
+                if (ag != nullptr && ag->can_dispatch(1, k) && ag->holds(d.layers, (int32_t) e)) {
+                    franken_owner[i] = (int32_t) a;
+                    break;
+                }
+            }
+        }
+        int32_t fkind[32];
+        for (size_t a = 0; a < d.franken_agents.size(); ++a) {
+            auto* ag = d.franken_agents[a];
+            if (ag == nullptr) continue;
+            bool any_for_a = false;
+            for (int64_t i = 0; i < k; ++i) {
+                if (franken_owner[i] == (int32_t) a) { fkind[i] = 3; any_for_a = true; }
+                else fkind[i] = -1;
+            }
+            if (any_for_a && !ag->launch(d.layers, x_f, ids, 1, k, fkind)) {
+                for (int64_t i = 0; i < k; ++i)
+                    if (franken_owner[i] == (int32_t) a) franken_owner[i] = -1;
+            }
+        }
+    }
+#endif
+
     for (int64_t i = 0; i < k; ++i) {
         const int64_t e = ids[i];
         if (e < 0 || e >= d.n_expert) {
@@ -4774,6 +4820,13 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
             d.fail_expert = e;
             return;
         }
+#if defined(__linux__)
+        if (use_franken && franken_owner[i] >= 0) {
+            ++d.offload_entries;
+            ++d.franken_agent_entries;
+            continue;
+        }
+#endif
         const uint8_t* b = d.src->blob(d.layers, e);
         if (b == nullptr) {
             // The one failure the loop cannot see.  Leaving `out` at its previous contents would feed the NEXT
@@ -4815,8 +4868,10 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     }
 
     // Plan v0.3 P4: rows of every expert across all threads (bitwise the same as `run`).
-    if (d.split_rows) d.pool->run_split(d.jobs.data(), (int) njobs);
-    else d.pool->run(d.jobs.data(), (int) njobs);
+    if (njobs > 0) {
+        if (d.split_rows) d.pool->run_split(d.jobs.data(), (int) njobs);
+        else d.pool->run(d.jobs.data(), (int) njobs);
+    }
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)
@@ -4824,6 +4879,45 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
                 d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
             }
     }
+#if defined(__linux__)
+    if (use_franken) {
+        std::vector<int32_t> salvaged;
+        for (auto* ag : d.franken_agents) {
+            if (ag != nullptr && ag->launched()) (void) ag->finish(out, salvaged);
+        }
+        if (!salvaged.empty()) {
+            if (!act_quantized) {
+                act_quant_q8_1(x_f, H, d.act);
+                act_quantized = true;
+            }
+            d.franken_salvaged_entries += (int64_t) salvaged.size();
+            ExpertJob sjobs[32];
+            int sn = 0;
+            for (int32_t entry : salvaged) {
+                const int64_t e = ids[entry];
+                const uint8_t* b = d.src->blob(d.layers, e);
+                if (b == nullptr) {
+                    d.failed = true;
+                    d.fail = "franken salvage: expert source could not produce a blob";
+                    d.fail_layer = d.layers;
+                    d.fail_expert = e;
+                    ++d.missing;
+                    return;
+                }
+                ExpertJob& j = sjobs[sn++];
+                j.blob = b;
+                j.act = &d.act;
+                j.out = out + (size_t) entry * (size_t) n_embd;
+                j.weight = 1.0f;
+                j.slot = (int) entry;
+            }
+            if (sn > 0) {
+                if (d.split_rows) d.pool->run_split(sjobs, sn);
+                else d.pool->run(sjobs, sn);
+            }
+        }
+    }
+#endif
     ++d.layers;
     d.experts += k;
 }
@@ -4905,7 +4999,25 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
-    int32_t kind[kMaxWindowEntries];       // per entry: -1 CPU, 0 VRAM, 1 PCIe
+    int32_t kind[kMaxWindowEntries];       // per entry: -1 CPU, 0 VRAM, 1 PCIe, 2 peer/remote, 3 franken agent
+#if defined(__linux__)
+    int32_t franken_owner[kMaxWindowEntries];
+    const bool use_franken = !d.franken_agents.empty();
+    if (use_franken) {
+        for (int64_t i = 0; i < n; ++i) franken_owner[i] = -1;
+    }
+    auto franken_find = [&](int32_t e) -> int32_t {
+        if (!use_franken) return -1;
+        for (size_t a = 0; a < d.franken_agents.size(); ++a) {
+            auto* ag = d.franken_agents[a];
+            if (ag != nullptr && ag->can_dispatch(n_tok, k) && ag->holds(d.layers, e)) return (int32_t) a;
+        }
+        return -1;
+    };
+#else
+    constexpr bool use_franken = false;
+    auto franken_find = [&](int32_t) -> int32_t { return -1; };
+#endif
     if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
         int64_t distinct[kMaxWindowEntries], first_of[kMaxWindowEntries];
         int nd = 0, nmiss = 0;
@@ -4926,7 +5038,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 distinct[nd++] = i;
                 const int32_t e = ids[i];
                 if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
-                    !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
+                    !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e) &&
+                    franken_find(e) < 0) ++nmiss;
             }
         }
         // STRATA_ROUTE_TAIL_SKIP=R (default 7 on CUDA serve, =0 off; changes the output): a missed expert that EVERY token of the window routes
@@ -4935,7 +5048,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int tail_rank = tail_skip_rank();
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
-        if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
+        if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0 && !use_franken) {
             int minr[kMaxWindowEntries];
             for (int q = 0; q < nd; ++q) minr[q] = 99;
             for (int64_t i = 0; i < n; ++i) {
@@ -4968,6 +5081,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const int64_t i0 = distinct[q];
             const int32_t e = ids[i0];
             int kd = -1;
+            int32_t fa = -1;
             unsigned long long ptr = 0;
             if (skip_d[q]) {                       // STRATA_ROUTE_TAIL_SKIP: neither copied nor computed
                 for (int64_t i = i0; i < n; ++i)
@@ -4984,6 +5098,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 2;                        // multi-GPU: the second GPU computes it
                 } else if (helper_holds(e)) {
                     // left to the helper: kind -1 until RemoteExperts::begin() claims the row (see above)
+                } else if ((fa = franken_find(e)) >= 0) {
+                    kd = 3;                        // FrankenStrata: foreign-vendor agent computes it over shm
                 } else if (d.fs != nullptr && d.fs->take(d.layers, e, ptr)) {
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
                 } else {
@@ -5001,7 +5117,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
             }
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) kind[i] = kd;
+                if (first_of[i] == i0) {
+                    kind[i] = kd;
+#if defined(__linux__)
+                    if (kd == 3) franken_owner[i] = fa;
+#endif
+                }
             if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
             P.ptr[groups] = ptr;
             P.start[groups] = entries;
@@ -5040,11 +5161,66 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
-            kind[i] = (e >= 0 && e < d.n_expert && d.host_res != nullptr &&
-                       d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) ? 0
-                    : (e >= 0 && e < d.n_expert && d.peer != nullptr && d.peer->has(d.layers, e)) ? 2 : -1;
+            if (e >= 0 && e < d.n_expert && d.host_res != nullptr &&
+                d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) {
+                kind[i] = 0;
+            } else if (e >= 0 && e < d.n_expert && d.peer != nullptr && d.peer->has(d.layers, e)) {
+                kind[i] = 2;
+            } else if (e >= 0 && e < d.n_expert) {
+                const int32_t fa = franken_find(e);
+                if (fa >= 0) {
+                    kind[i] = 3;
+#if defined(__linux__)
+                    franken_owner[i] = fa;
+#endif
+                } else {
+                    kind[i] = -1;
+                }
+            } else {
+                kind[i] = -1;
+            }
         }
     }
+#if defined(__linux__)
+    // FrankenStrata: ring agent doorbells right after GpuPlanSink publish so Primary VRAM + Agent(s) + CPU overlap.
+    if (use_franken) {
+        int32_t fkind[kMaxWindowEntries];
+        const bool single_agent = d.franken_agents.size() == 1;
+        int32_t cur_cpu_entries = 0;
+        for (int64_t i = 0; i < n; ++i)
+            if (kind[i] == -1) ++cur_cpu_entries;
+        for (size_t a = 0; a < d.franken_agents.size(); ++a) {
+            auto* ag = d.franken_agents[a];
+            if (ag == nullptr) continue;
+            int32_t n_for_a = 0;
+            const int32_t* kptr = kind;
+            if (single_agent) {
+                for (int64_t i = 0; i < n; ++i)
+                    if (franken_owner[i] == 0) ++n_for_a;
+            } else {
+                for (int64_t i = 0; i < n; ++i) {
+                    if (franken_owner[i] == (int32_t) a) { fkind[i] = 3; ++n_for_a; }
+                    else fkind[i] = (kind[i] == 3 ? -1 : kind[i]);
+                }
+                kptr = fkind;
+            }
+            if (n_for_a == 0) continue;
+            // Phase 2 cost-model gating: keep tiny high-IPC-overhead batches on CPU when faster.
+            const bool gated = d.franken_controller != nullptr &&
+                               !d.franken_controller->should_dispatch_agent(a, n_for_a, cur_cpu_entries);
+            if (gated || !ag->launch(d.layers, x_f, ids, n_tok, k, kptr)) {
+                if (gated) d.franken_gated_entries += n_for_a;
+                cur_cpu_entries += n_for_a;
+                for (int64_t i = 0; i < n; ++i) {
+                    if (franken_owner[i] == (int32_t) a) {
+                        franken_owner[i] = -1;
+                        kind[i] = -1;
+                    }
+                }
+            }
+        }
+    }
+#endif
     if (d.peer != nullptr) {                 // multi-GPU: start the second GPU's share before the CPU's own work
         std::string perr;
         if (!d.peer->launch(d.layers, x_f, ids, n_tok, k, kind, perr, out)) {
@@ -5080,6 +5256,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (!published) ++d.stale_x;
     }
     const auto c1 = std::chrono::steady_clock::now();
+#if defined(__linux__)
+    bool tok_quantized[strata::kernels::kWindowMaxT] = {};
+#endif
     if (any_cpu) {
         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
         const bool ep = d.remote_count > 0 && d.remote[0]->optimized_decode();
@@ -5091,6 +5270,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
             else
                 act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+#if defined(__linux__)
+            tok_quantized[(size_t) t] = true;
+#endif
         }
     }
     const auto c2 = std::chrono::steady_clock::now();
@@ -5156,13 +5338,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 ++d.tail_skipped;
                 continue;
             }
-            if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
+            if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer/agent result staged into this row below
                 if (kind[i] == 0) ++d.cache_hits;
                 else ++d.offload_entries;                       // #588: PCIe or another GPU
                 if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
+                if (kind[i] == 3) ++d.franken_agent_entries;
                 // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it;
-                // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
+                // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU;
+                // kind 3: agent finish() overwrites 100% of every kind 3 row (via shm copy or CPU salvage)
                 if (!((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
+                      kind[i] == 3 ||
                       (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
                     std::memset(row, 0, (size_t) H * sizeof(float));
                 continue;
@@ -5267,6 +5452,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs, arithmetic);
         else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
     }
+#if defined(__linux__)
+    if (use_franken && d.franken_controller != nullptr && njobs > 0) {
+        const double cpu_ms =
+            npend == 0 ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c3).count()
+                       : run_ms_extra;
+        d.franken_controller->observe_cpu(njobs, cpu_ms);
+    }
+#endif
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)
@@ -5284,6 +5477,85 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             return;
         }
     }
+#if defined(__linux__)
+    if (use_franken) {
+        static thread_local std::vector<int32_t> salvaged;
+        salvaged.clear();
+        for (size_t a = 0; a < d.franken_agents.size(); ++a) {
+            auto* ag = d.franken_agents[a];
+            if (ag != nullptr && ag->launched()) {
+                if (ag->finish(out, salvaged) && d.franken_controller != nullptr) {
+                    d.franken_controller->observe_agent(a, ag->last_round_entries(), ag->last_round_ms());
+                }
+            }
+        }
+        if (!salvaged.empty()) {
+            d.franken_salvaged_entries += (int64_t) salvaged.size();
+            static thread_local std::vector<int64_t> smiss;
+            smiss.clear();
+            for (int32_t entry : salvaged) {
+                const int64_t t = entry / k;
+                if (!tok_quantized[(size_t) t]) {
+                    if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))
+                        act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+                    else if (native)
+                        native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H,
+                                         d.nact_multi.data() + (size_t) t * kNativeActBytes);
+                    else
+                        act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+                    tok_quantized[(size_t) t] = true;
+                }
+                const int64_t e = ids[entry];
+                if (e >= 0 && e < d.n_expert &&
+                    std::find(smiss.begin(), smiss.end(), e) == smiss.end()) {
+                    smiss.push_back(e);
+                }
+            }
+            if (!smiss.empty()) d.src->prefetch(d.layers, smiss.data(), (int64_t) smiss.size());
+
+            static thread_local std::vector<ExpertJobMulti> sjobs;
+            sjobs.clear();
+            for (int64_t e : smiss) {
+                const uint8_t* b = d.src->blob(d.layers, e);
+                if (b == nullptr) {
+                    d.failed = true;
+                    d.fail = "franken salvage: expert source could not produce a blob";
+                    d.fail_layer = d.layers;
+                    d.fail_expert = e;
+                    ++d.missing;
+                    return;
+                }
+                ExpertJobMulti cur{};
+                cur.blob = b;
+                cur.nt = 0;
+                cur.fmt = nullptr;
+                for (int32_t entry : salvaged) {
+                    if (ids[entry] != e) continue;
+                    if (cur.nt == MAXT) {
+                        sjobs.push_back(cur);
+                        cur = ExpertJobMulti{};
+                        cur.blob = b;
+                        cur.nt = 0;
+                        cur.fmt = nullptr;
+                    }
+                    const int64_t t = entry / k;
+                    cur.act[cur.nt] = &d.act_multi[(size_t) t];
+                    cur.nact[cur.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
+                    cur.out[cur.nt] = out + (size_t) entry * H;
+                    ++cur.nt;
+                }
+                if (cur.nt > 0) sjobs.push_back(cur);
+            }
+            for (size_t off = 0; off < sjobs.size(); off += (size_t) ExpertPool::kMaxSplitMulti) {
+                const int chunk = (int) std::min<size_t>((size_t) ExpertPool::kMaxSplitMulti, sjobs.size() - off);
+                if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], sjobs.data() + off, chunk, arithmetic);
+                else d.pool->run_split_multi(sjobs.data() + off, chunk);
+            }
+            d.multi_misses += (int64_t) sjobs.size();
+            d.multi_entries += (int64_t) salvaged.size();
+        }
+    }
+#endif
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };

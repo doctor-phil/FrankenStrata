@@ -1,50 +1,77 @@
 # franken/ — FrankenStrata additions
 
-Everything FrankenStrata adds lives in this directory as **new files**; no
-upstream file is modified (fork hygiene: DESIGN §12 — a new feature is opt-in
-and the default path stays byte-identical to upstream). Primary-side patches
-(`--franken-agent`, kind 3, `AgentTier`, `AgentExpertSource`) are Phase 1 work
-and will land as their own new files plus flagged touch-points listed in
-DESIGN §5; they are not here yet.
+FrankenStrata adds cross-vendor multi-GPU expert offloading over POSIX shared
+memory (`/dev/shm`) and non-private Linux futexes. New code lives in `franken/`;
+upstream touch-points are opt-in behind `--franken-agent` (when omitted, default
+Strata behavior is unchanged).
 
 Design references are to `DESIGN.md` in Philip's research notes
 (`~/workspace/research_notes/strata-multi-gpu-recon/DESIGN.md`).
 
 ## File map
 
-| File | What it is | Design |
-|---|---|---|
-| `wire/franken_wire.hpp` | The shared-memory wire protocol as a self-contained C++17 header: segment layout, control block, descriptor/row rings, control + ack messages, handshake and generation discipline. Layout and semantics only — no OS calls. | §4 (all of it; see per-part map below) |
-| `agent/agent_spike.cpp` | The Phase 0 agent spike: opens the validation pack with the SYCL ports, fills the SYCL `ExpertCache`, replays recorded (activation, ids) windows, and compares agent rows against the CPU-row reference with the §8.2 statistics. GPU/SYCL bodies are TODO stubs that fail loudly; host-side loader, fill builder, and statistics are real code. Compiles standalone (host C++17). | §7 Phase 0 (spike), §6.2 (reuse inventory), §8.2 (statistics) |
-
-## `wire/franken_wire.hpp` — part-by-part design map
-
-| Header part | Design |
+| File | What it is |
 |---|---|
-| Magic / protocol version, geometry block, pack identity | §4.2, §4.3 step 1 |
-| Vendor-neutrality rules (comment block at top) | §4.1 |
-| Caps + HELLO | §4.2 (caps), §4.3 step 2, §5.4 (vendor self-identifies) |
-| Control block, cache-line-isolated writer fields | §4.2 |
-| `agent_state` (Absent/Loading/Ready/Dead), heartbeat | §4.2, §4.5 |
-| `residency_gen`, generation discipline | §4.2, §6.3 |
-| `doorbell_seq`, descriptor ring (R = 8), slot arenas | §4.2, §4.4 |
-| Slot state word: Empty → Published → Claimed → Done \| Salvaged | §4.2, §4.4, §4.5 |
-| Futex-on-the-state-word signaling, spin budgets | §4.4.1 |
-| Deadline/salvage constants, heartbeat staleness (250 ms) | §4.5 |
-| Row arena = the primary's `out` buffer | §4.2, §4.4 step 3 |
-| Control ring: OPEN / PROMOTE / DEMOTE / RESYNC / BYE | §4.2, §4.3 step 3, §6.3, §4.5.1 |
-| Ack ring: HELLO / OPEN_ACK / PROMOTE_ACK / DEMOTE_ACK / ERROR | §4.2, §4.3 steps 2+4, §6.3 |
-| `PayloadKind` (expert rows only in v1, space kept open) | §13 Q6 (non-preclusion) |
-| Session caps inherited, not hardcoded (MAXT = 8, 128 entries) | §3.1 |
-| OS primitives named, never used (segment, doorbell word, clock) | §4.6, §13 Q4 |
+| `wire/franken_wire.hpp` | Pure C++17 wire layout spec: control block, descriptor/row rings, control/ack SPSC rings, slot state machine (`Empty -> Published -> Claimed -> Done \| Salvaged`), constants. |
+| `wire/franken_ipc.{hpp,cpp}` | POSIX `shm_open`/`ftruncate`/`mmap`/`shm_unlink` lifecycle, non-private cross-process `FUTEX_WAIT`/`FUTEX_WAKE`, `CLOCK_MONOTONIC` helpers, bounded spin-before-park waits, SPSC ring helpers, deterministic variable-area plan, heartbeat monitor. |
+| `wire/pack_identity.hpp` | Deterministic FNV-1a `PackIdentity` computation shared by primary and agents across host/container mounts. |
+| `tests/franken_ipc_test.cpp` | GPU-less unit tests: layout math, SPSC ring wraparound, `Salvaged` race guard, 250 ms heartbeat staleness + `SIGKILL`, cross-process handshake & 36-round descriptor ring wraparound. |
+| `agent/agent_spike.cpp` | Phase 0 SYCL extraction spike (`franken-agent-spike` in `sycl/CMakeLists.txt`): loads pack/GGUF + SYCL `ExpertCache`, replays `FRKW` windows (or `--random-windows`), reports SYCL-vs-CPU `rel_l2`, `max_abs/rms`, `cosine`, and compute latency. |
+| `agent/agent_loop.{hpp,cpp}` | Vendor-neutral agent runtime: attaches shm, verifies `PackIdentity` + `Geometry`, posts `HELLO` + `Caps`, runs 10 ms heartbeat thread, handles `OPEN`/`BYE` (+ Phase 2 `PROMOTE`/`DEMOTE`/`RESYNC` hooks), spins/parks on doorbell, verifies `SlotState::Claimed` before writing rows. |
+| `agent/franken_agent_cpu.cpp` | Vendor-free CPU conformance/CI agent (`franken-agent-cpu`, zero GPU dependencies; supports `OPEN`, `PROMOTE`, `DEMOTE`, `RESYNC`, `BYE`). |
+| `agent/franken_agent_sycl.cpp` | Intel Arc SYCL agent (`franken-agent-sycl`, supports native IQ packs with Hadamard and canonical s2 packs, plus slot-room-safe `PROMOTE`/`DEMOTE`/`RESYNC`). |
+| `primary/agent_tier.{hpp,cpp}` | Primary-side `AgentTier` managing 1..N foreign-vendor agents (`--franken-agent <shm>[,slots=N]`, `--franken-deadline-ms`), disjoint profile/layer-early assignment at `OPEN`, kind-3 dispatch overlap, `PROMOTE`/`DEMOTE`/`RESYNC` control, deadline salvage -> CPU recompute fallback, and 250 ms heartbeat staleness -> `Dead`. |
+| `profiler/hw_profile.{hpp,cpp}` | Phase 2 hardware profile JSON schema (`franken-hw-profile.json`), serializer/parser, linear latency fit, and deterministic `recommend_tier_plan`. |
+| `profiler/franken_profile.cpp` | Phase 2 optional hardware profiler CLI (`franken-profile`): benchmarks host CPU/RAM + attached `/dev/shm` agents across batch sizes `1, 2, 4, 8[, 16]`, writes `franken-hw-profile.json`, and prints recommended launch flags. |
+| `control/tier_controller.{hpp,cpp}` | Phase 2 dynamic multi-tier controller: online exponentially-weighted latency cost model (`--franken-cost-model on\|off`, seeded via `--franken-profile`), deduplication `DEMOTE`, Primary-evicted cascade into Agent VRAM, and hot CPU-miss swaps (`--franken-adapt-swaps N`). |
+| `tests/franken_phase2_test.cpp` | GPU-less Phase 2 unit tests: `HwProfile` JSON round-trip, `recommend_tier_plan` ordering, live cross-process `PROMOTE`/`DEMOTE`/`RESYNC` over shm, cascade swap planner, and online cost-model gating. |
 
-## Phase 0 status
+## Build & verification commands (run on hardware rig)
 
-- Wire header: compiles standalone (`g++ -std=c++17`); layout math verified
-  against the §3.1 s2 geometry (48 layers, H = 2560, 128 entries →
-  1,310,720 B row slots).
-- Spike: compiles standalone; with no arguments it prints usage and exits 2;
-  any run stops at the first unlinked SYCL TODO with a named error — it
-  cannot fabricate numbers.
-- Next: link the spike against the SYCL tree on the B70 (the runbook's job),
-  grow the primary-side `--franken-agent` scaffolding (Phase 1, DESIGN §5).
+1. **GPU-less IPC unit tests:**
+   ```sh
+   g++ -std=c++20 -O2 -Wall -Wextra -I. franken/wire/franken_ipc.cpp franken/tests/franken_ipc_test.cpp -pthread -lrt -o build-ipc-test
+   ./build-ipc-test
+   ```
+2. **SYCL spike + SYCL agent (Docker `strata-sycl-dev:latest`, Arc Pro B70):**
+   ```sh
+   docker run --rm -it --device /dev/dri \
+     -v "$PWD:/src" \
+     -v /home/phil/github/frankenstrata/build-sycl-aot/_deps/strata_llamacpp-src:/ggml:ro \
+     -v /work/Strata-data:/work/Strata-data:ro \
+     -v /dev/shm:/dev/shm \
+     strata-sycl-dev:latest bash -lc '
+       cmake -S /src/sycl -B /src/build-sycl-franken -G Ninja \
+         -DCMAKE_CXX_COMPILER=icpx -DSTRATA_SYCL_AOT=bmg-g31 -DSTRATA_GGML_DIR=/ggml
+       cmake --build /src/build-sycl-franken --target franken-agent-spike franken-agent-sycl
+     '
+   ```
+3. **HIP primary + CPU agent (host, RX 7900 XTX `gfx1100` using TheRock ROCm wheels):**
+   ```sh
+   cmake -S . -B build-hip-franken -G Ninja \
+     -DSTRATA_ENABLE_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx1100 \
+     -DSTRATA_GGML_DIR=/home/phil/github/frankenstrata/build-sycl-aot/_deps/strata_llamacpp-src \
+     -DCMAKE_PREFIX_PATH="$ROCM_PREFIX" -DCMAKE_HIP_COMPILER="$ROCM_PREFIX/lib/llvm/bin/clang++"
+   cmake --build build-hip-franken --target strata franken_ipc_test franken-agent-cpu
+   ./build-hip-franken/franken_ipc_test
+   ```
+4. **7900 XTX (HIP primary) + B70 (SYCL agent) on Coder IQ1_M + SIGKILL drill:**
+   - Terminal 1 (Docker B70):
+     ```sh
+     docker run --rm --device /dev/dri -v "$PWD:/src" -v /work/Strata-data:/work/Strata-data:ro -v /dev/shm:/dev/shm \
+       strata-sycl-dev:latest /src/build-sycl-franken/franken-agent-sycl \
+       --shm /franken0 --pack /work/Strata-data/packs/coder-iq1_m \
+       --native /work/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf
+     ```
+   - Terminal 2 (Host 7900 XTX):
+     ```sh
+     ./build-hip-franken/strata \
+       --pack /work/Strata-data/packs/coder-iq1_m \
+       --native /work/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf \
+       --mtp /work/Strata-data/mtp/rt \
+       --expert-profile data/expert-profile-coder-2026-11-04.bin \
+       --expert-cache auto --spec 4 --spec-min-p 0.5 --max-context 8192 \
+       --tokens-file sycl/tools/data/prompt_deadlock_2744.tok --max-tokens 64 --temp 0 \
+       --franken-agent /franken0
+     ```
+   - Kill drill: `kill -9 <franken-agent-sycl PID>` mid-generation; primary must salvage within deadline / 250 ms heartbeat staleness and finish cleanly on CPU with zero hangs or NaNs.

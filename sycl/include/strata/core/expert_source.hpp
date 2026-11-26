@@ -42,6 +42,13 @@ namespace strata::kernels::cpu {
 struct ExpertLayout;
 }
 
+namespace franken::primary {
+class AgentTier;
+}
+namespace franken::control {
+class TierController;
+}
+
 namespace strata::core {
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
@@ -387,6 +394,12 @@ struct ExpertDispatch {
     /// Multi-GPU: the second GPU's tier.  Its experts are computed there instead of on the CPU (kind 2).
     PeerExperts* peer = nullptr;
     int64_t peer_entries = 0;      ///< routed entries the peer served in verify windows
+    /// FrankenStrata: opt-in foreign-vendor agent tiers over POSIX shm (kind 3). Empty unless --franken-agent is passed.
+    std::vector<franken::primary::AgentTier*> franken_agents;
+    franken::control::TierController* franken_controller = nullptr;
+    int64_t franken_agent_entries = 0;
+    int64_t franken_salvaged_entries = 0;
+    int64_t franken_gated_entries = 0;
     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is
     /// where a source failure surfaces: the driver checks it after `session_loop` returns rather than the
     /// engine computing from a half-filled `parts`.
