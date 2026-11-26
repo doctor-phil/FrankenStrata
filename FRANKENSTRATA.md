@@ -111,17 +111,21 @@ Measured on one rig: **AMD Ryzen 9 5900XT (16C/32T, 64 GB DDR4-3200)**, **AMD RX
 
 ### End-to-End Decode & Parity on Strata `v0.2.22` / Engine `0.1.69` (`prompt_deadlock_2744.tok`, 64 generated tokens)
 
-| Configuration (`v0.2.22` / engine `0.1.69`) | Decode tok/s | Prefill tok/s | Salvages | Agent `launch / wait / copy` (ms/rd) | Token parity vs solo HIP |
+| Configuration (`v0.2.22` / engine `0.1.69`) | Decode tok/s | Prefill tok/s | Salvages | Agent `launch / wait / copy` (ms/rd) | Token parity vs solo |
 | --- | ---: | ---: | ---: | --- | --- |
 | Solo Intel Arc Pro B70 32 GB (SYCL AOT, `12,288/12,288` resident) | **77.03** | 702.46 | — | — | **64/64 exact** |
 | Mixed 7900 XTX + B70 (`auto` + `3,200` slots, cost-model on + `franken-profile`) | **76.57 (+2.6%)** | 938.96 | **0** | `0.003 / 0.283 / 0.002` | **64/64 exact*** |
 | Mixed 7900 XTX + B70 (`auto` + `3,200` slots, static / cost-model off) | **76.21 (+2.2%)** | 964.57 | **0** | `0.132 / 1.834 / 0.021` | **64/64 exact*** |
-| Solo AMD RX 7900 XTX 24 GB (HIP `gfx1100`, `auto` = `9,121/12,288` slots) | **74.60** | 965.05 | — | — | baseline (64/64) |
+| Solo AMD RX 7900 XTX 24 GB (HIP `gfx1100`, `auto` = `9,121/12,288` slots) | **74.60** | 965.05 | — | — | XTX auto baseline (64/64) |
 | **Mixed 7900 XTX + B70 (cap `5,000` + `3,000`, 3-tier dynamic + cost-model on)** | **72.20 (+9.5%)** | 729.23 | **0** | `0.079 / 0.698 / 0.039` | **64/64 exact** (`27/27` async promotes, `146` demotes) |
 | Mixed 7900 XTX + B70 (cap `5,000` + `3,000`, static / cost-model off) | **70.86 (+7.5%)** | 738.17 | **0** | `0.221 / 1.494 / 0.058` | **64/64 exact** (`1,130/1,130` rounds) |
-| Solo AMD RX 7900 XTX 24 GB (HIP `gfx1100`, cap `5,000/12,288` slots) | **65.94** | 715.50 | — | — | 5k baseline (64/64) |
+| Solo AMD RX 7900 XTX 24 GB (HIP `gfx1100`, `--expert-cache 5000`) | **65.94** | 715.50 | — | — | XTX 5k baseline (64/64) |
+| **Reverse Mixed B70 + 7900 XTX HIP (cap `5,000` + `3,000`, 3-tier dynamic + CM on)** | **59.09 (+7.4%)** | 273.49 | 1 | `0.005 / 2.257 / 0.002` | **64/64 exact** vs B70 5k† |
+| Solo Intel Arc Pro B70 32 GB (SYCL AOT, `--expert-cache 5000` → 6,519 slots) | **55.00** | 273.08 | — | — | B70 5k baseline (64/64) |
+| Reverse Mixed B70 + 7900 XTX HIP (cap `5,000` + `3,000`, static / CM off) | **52.71 (-4.2%)** | 273.61 | 2 | `0.232 / 9.197 / 0.074` | **64/64 exact** vs B70 5k (`1,066/1,068` rounds)† |
 
 *\*On `v0.2.22`, `gfx11` enables dynamic `STRATA_PREFILL_CPU_SHARE` by default, which drifted between share `0.82` and `0.84` on the two `auto` mixed runs (59/64, first diff at token 59). With `STRATA_PREFILL_CPU_SHARE=0`, both `auto` static and `auto` cost-model-on match solo **64/64** identically.*
+*†Reverse direction runs SYCL AOT `strata` inside `strata-sycl-dev:latest` paired with host `franken-agent-hip` over `/dev/shm`. On round 0, cold HIP code-object loading (~60 ms) tripped 1–2 deadline salvages (warming `franken-agent-hip` on `OPEN` is a planned follow-up); the dynamic run used the same `--adapt-every 4 --adapt-swaps 32 --franken-adapt-swaps 16 --franken-cost-model on --franken-profile` flags as the forward capped dynamic run (with default `--adapt-swaps` and `--franken-deadline-ms 120`, reverse dynamic ran `54.44 tok/s`, 0 salvages, 64/64 exact).*
 
 Key takeaways on `v0.2.22` (`0.1.69`):
 

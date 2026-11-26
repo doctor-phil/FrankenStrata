@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 448" width="920" height="448" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 572" width="920" height="572" role="img" aria-labelledby="title desc">
   <title id="title">FrankenStrata Decode Throughput — Qwen3.8-Flash-Next Coder IQ1_M (Strata v0.2.22 / engine 0.1.69)</title>
-  <desc id="desc">Horizontal bar chart sorted descending by decode tokens per second on Ryzen 9 5900XT, AMD RX 7900 XTX 24 GB, and Intel Arc Pro B70 32 GB.</desc>
+  <desc id="desc">Horizontal bar chart sorted strictly descending by decode tokens per second across AMD RX 7900 XTX 24 GB (HIP) and Intel Arc Pro B70 32 GB (SYCL AOT), including both forward (HIP primary + SYCL agent) and reverse (SYCL primary + HIP agent) mixed configurations.</desc>
   <style>
     :root {
       --bg: #ffffff;
@@ -13,7 +13,9 @@
       --sublabel: #59636e;
       --val: #1f2328;
       --delta: #0a7d56;
+      --delta-neg: #cf222e;
       --bar-mixed: #0e9f6e;
+      --bar-rev: #0d9488;
       --bar-b70: #2563eb;
       --bar-xtx: #d97706;
     }
@@ -29,7 +31,9 @@
         --sublabel: #8b949e;
         --val: #f0f6fc;
         --delta: #34d399;
+        --delta-neg: #f85149;
         --bar-mixed: #10b981;
+        --bar-rev: #14b8a6;
         --bar-b70: #3b82f6;
         --bar-xtx: #f59e0b;
       }
@@ -38,11 +42,12 @@
     .bg { fill: var(--bg); stroke: var(--border); stroke-width: 1; }
     .title { font-size: 17px; font-weight: 700; fill: var(--title); }
     .subtitle { font-size: 12px; fill: var(--muted); }
-    .legend { font-size: 12px; fill: var(--label); }
+    .legend { font-size: 11.5px; fill: var(--label); }
     .label { font-size: 12.5px; font-weight: 600; fill: var(--label); }
     .sublabel { font-size: 11px; fill: var(--sublabel); }
     .val { font-size: 12.5px; font-weight: 700; fill: var(--val); }
     .delta { font-size: 11px; font-weight: 600; fill: var(--delta); }
+    .delta-neg { font-size: 11px; font-weight: 600; fill: var(--delta-neg); }
     .tick { font-size: 11px; fill: var(--muted); }
     .grid { stroke: var(--grid); stroke-width: 1; }
     .axis { stroke: var(--axis); stroke-width: 1; }
@@ -50,7 +55,7 @@
   </style>
 
   <!-- Card background -->
-  <rect x="0.5" y="0.5" width="919" height="447" rx="10" class="bg"/>
+  <rect x="0.5" y="0.5" width="919" height="571" rx="10" class="bg"/>
 
   <!-- Header -->
   <text x="24" y="34" class="title">FrankenStrata Decode Throughput — Qwen3.8-Flash-Next Coder IQ1_M</text>
@@ -58,75 +63,97 @@
 
   <!-- Legend -->
   <rect x="24" y="68" width="12" height="12" rx="3" fill="var(--bar-mixed)"/>
-  <text x="41" y="78" class="legend">Mixed 7900 XTX + B70 (FrankenStrata)</text>
-  <rect x="292" y="68" width="12" height="12" rx="3" fill="var(--bar-b70)"/>
-  <text x="309" y="78" class="legend">Solo Intel Arc Pro B70 (SYCL AOT)</text>
-  <rect x="536" y="68" width="12" height="12" rx="3" fill="var(--bar-xtx)"/>
-  <text x="553" y="78" class="legend">Solo AMD RX 7900 XTX (HIP)</text>
+  <text x="41" y="78" class="legend">Mixed XTX + B70</text>
+  <rect x="160" y="68" width="12" height="12" rx="3" fill="var(--bar-rev)"/>
+  <text x="177" y="78" class="legend">Reverse B70 + XTX (HIP agent)</text>
+  <rect x="372" y="68" width="12" height="12" rx="3" fill="var(--bar-b70)"/>
+  <text x="389" y="78" class="legend">Solo Arc Pro B70 (SYCL AOT)</text>
+  <rect x="572" y="68" width="12" height="12" rx="3" fill="var(--bar-xtx)"/>
+  <text x="589" y="78" class="legend">Solo RX 7900 XTX (HIP)</text>
 
-  <!-- Plot area: x0=310, width=440 (scale: 0..85 tok/s -> 5.17647 px per tok/s), y=98..384 -->
-  <!-- Vertical grid lines at 0, 20, 40, 60, 80 -->
-  <line x1="310" y1="98" x2="310" y2="386" class="axis"/>
-  <line x1="413.5" y1="98" x2="413.5" y2="386" class="grid"/>
-  <line x1="517.1" y1="98" x2="517.1" y2="386" class="grid"/>
-  <line x1="620.6" y1="98" x2="620.6" y2="386" class="grid"/>
-  <line x1="724.1" y1="98" x2="724.1" y2="386" class="grid"/>
+  <!-- Plot area: x0=310, width=440 (scale: 0..85 tok/s -> 5.17647 px per tok/s), y=98..509 -->
+  <line x1="310" y1="98" x2="310" y2="510" class="axis"/>
+  <line x1="413.5" y1="98" x2="413.5" y2="510" class="grid"/>
+  <line x1="517.1" y1="98" x2="517.1" y2="510" class="grid"/>
+  <line x1="620.6" y1="98" x2="620.6" y2="510" class="grid"/>
+  <line x1="724.1" y1="98" x2="724.1" y2="510" class="grid"/>
 
   <!-- X-axis tick labels -->
-  <text x="310" y="403" text-anchor="middle" class="tick">0</text>
-  <text x="413.5" y="403" text-anchor="middle" class="tick">20</text>
-  <text x="517.1" y="403" text-anchor="middle" class="tick">40</text>
-  <text x="620.6" y="403" text-anchor="middle" class="tick">60</text>
-  <text x="724.1" y="403" text-anchor="middle" class="tick">80 tok/s</text>
+  <text x="310" y="527" text-anchor="middle" class="tick">0</text>
+  <text x="413.5" y="527" text-anchor="middle" class="tick">20</text>
+  <text x="517.1" y="527" text-anchor="middle" class="tick">40</text>
+  <text x="620.6" y="527" text-anchor="middle" class="tick">60</text>
+  <text x="724.1" y="527" text-anchor="middle" class="tick">80 tok/s</text>
 
-  <!-- Bar 1: Solo B70 — 77.03 tok/s (width = 77.03 * 5.17647 = 398.7) -->
-  <text x="298" y="118" text-anchor="end" class="label">Solo Arc Pro B70 32 GB</text>
+  <!-- Bar 1: Solo B70 auto — 77.03 tok/s (w = 398.7) -->
+  <text x="298" y="118" text-anchor="end" class="label">Solo Arc Pro B70 32 GB (auto)</text>
   <text x="298" y="132" text-anchor="end" class="sublabel">SYCL AOT · 12,288/12,288 resident (prefill 702 tok/s)</text>
   <rect x="310" y="106" width="398.7" height="24" rx="4" fill="var(--bar-b70)"/>
   <text x="716.7" y="122.5" class="val">77.03 tok/s</text>
 
-  <!-- Bar 2: Mixed auto + 3.2k, cost-model on — 76.57 tok/s (width = 396.4) -->
+  <!-- Bar 2: Mixed XTX + B70 auto, CM on — 76.57 tok/s (w = 396.4) -->
   <text x="298" y="159" text-anchor="end" class="label">Mixed 7900 XTX + B70 (auto, CM on)</text>
   <text x="298" y="173" text-anchor="end" class="sublabel">9,121 + 3,167 slots · hw-profile (prefill 939 tok/s)</text>
   <rect x="310" y="147" width="396.4" height="24" rx="4" fill="var(--bar-mixed)"/>
   <text x="714.4" y="163.5" class="val">76.57 tok/s</text>
   <text x="790" y="163.5" class="delta">+2.6% vs XTX auto</text>
 
-  <!-- Bar 3: Mixed auto + 3.2k, static — 76.21 tok/s (width = 394.5) -->
+  <!-- Bar 3: Mixed XTX + B70 auto, static — 76.21 tok/s (w = 394.5) -->
   <text x="298" y="200" text-anchor="end" class="label">Mixed 7900 XTX + B70 (auto, static)</text>
   <text x="298" y="214" text-anchor="end" class="sublabel">9,121 + 3,167 slots · CM off (prefill 965 tok/s)</text>
   <rect x="310" y="188" width="394.5" height="24" rx="4" fill="var(--bar-mixed)"/>
   <text x="712.5" y="204.5" class="val">76.21 tok/s</text>
   <text x="788" y="204.5" class="delta">+2.2% vs XTX auto</text>
 
-  <!-- Bar 4: Solo 7900 XTX auto — 74.60 tok/s (width = 386.2) -->
+  <!-- Bar 4: Solo 7900 XTX auto — 74.60 tok/s (w = 386.2) -->
   <text x="298" y="241" text-anchor="end" class="label">Solo RX 7900 XTX 24 GB (auto)</text>
   <text x="298" y="255" text-anchor="end" class="sublabel">HIP gfx1100 · 9,121/12,288 slots (prefill 965 tok/s)</text>
   <rect x="310" y="229" width="386.2" height="24" rx="4" fill="var(--bar-xtx)"/>
   <text x="704.2" y="245.5" class="val">74.60 tok/s</text>
-  <text x="780" y="245.5" class="sublabel">auto baseline</text>
+  <text x="780" y="245.5" class="sublabel">XTX auto baseline</text>
 
-  <!-- Bar 5: Mixed cap 5k + 3k, 3-tier dynamic — 72.20 tok/s (width = 373.7) -->
+  <!-- Bar 5: Mixed XTX + B70 5k+3k, dynamic — 72.20 tok/s (w = 373.7) -->
   <text x="298" y="282" text-anchor="end" class="label">Mixed 7900 XTX + B70 (5k+3k, dynamic)</text>
   <text x="298" y="296" text-anchor="end" class="sublabel">3-tier async PROMOTE + CM on · 0 salvages</text>
   <rect x="310" y="270" width="373.7" height="24" rx="4" fill="var(--bar-mixed)"/>
   <text x="691.7" y="286.5" class="val">72.20 tok/s</text>
   <text x="768" y="286.5" class="delta">+9.5% vs XTX 5k</text>
 
-  <!-- Bar 6: Mixed cap 5k + 3k, static — 70.86 tok/s (width = 366.8) -->
+  <!-- Bar 6: Mixed XTX + B70 5k+3k, static — 70.86 tok/s (w = 366.8) -->
   <text x="298" y="323" text-anchor="end" class="label">Mixed 7900 XTX + B70 (5k+3k, static)</text>
-  <text x="298" y="337" text-anchor="end" class="sublabel">5,000 primary + 3,000 agent slots · CM off</text>
+  <text x="298" y="337" text-anchor="end" class="sublabel">5k primary budget + 3k SYCL agent · CM off</text>
   <rect x="310" y="311" width="366.8" height="24" rx="4" fill="var(--bar-mixed)"/>
   <text x="684.8" y="327.5" class="val">70.86 tok/s</text>
   <text x="761" y="327.5" class="delta">+7.5% vs XTX 5k</text>
 
-  <!-- Bar 7: Solo 7900 XTX cap 5k — 65.94 tok/s (width = 341.3) -->
+  <!-- Bar 7: Solo 7900 XTX cap 5k — 65.94 tok/s (w = 341.3) -->
   <text x="298" y="364" text-anchor="end" class="label">Solo RX 7900 XTX 24 GB (cap 5,000)</text>
-  <text x="298" y="378" text-anchor="end" class="sublabel">HIP gfx1100 · 5,000/12,288 slots (~41% VRAM)</text>
+  <text x="298" y="378" text-anchor="end" class="sublabel">HIP gfx1100 · --expert-cache 5000 (prefill 716 tok/s)</text>
   <rect x="310" y="352" width="341.3" height="24" rx="4" fill="var(--bar-xtx)"/>
   <text x="659.3" y="368.5" class="val">65.94 tok/s</text>
-  <text x="735" y="368.5" class="sublabel">5k cap baseline</text>
+  <text x="735" y="368.5" class="sublabel">XTX 5k baseline</text>
+
+  <!-- Bar 8: Reverse B70 + XTX HIP 5k+3k, dynamic — 59.09 tok/s (w = 305.9) -->
+  <text x="298" y="405" text-anchor="end" class="label">Reverse B70 + 7900 XTX (5k+3k, dynamic)</text>
+  <text x="298" y="419" text-anchor="end" class="sublabel">SYCL primary + HIP agent · CM on + hw-profile</text>
+  <rect x="310" y="393" width="305.9" height="24" rx="4" fill="var(--bar-rev)"/>
+  <text x="623.9" y="409.5" class="val">59.09 tok/s</text>
+  <text x="700" y="409.5" class="delta">+7.4% vs B70 5k</text>
+
+  <!-- Bar 9: Solo B70 cap 5k — 55.00 tok/s (w = 284.7) -->
+  <text x="298" y="446" text-anchor="end" class="label">Solo Arc Pro B70 32 GB (cap 5,000)</text>
+  <text x="298" y="460" text-anchor="end" class="sublabel">SYCL AOT · --expert-cache 5000 (prefill 273 tok/s)</text>
+  <rect x="310" y="434" width="284.7" height="24" rx="4" fill="var(--bar-b70)"/>
+  <text x="602.7" y="450.5" class="val">55.00 tok/s</text>
+  <text x="679" y="450.5" class="sublabel">B70 5k baseline</text>
+
+  <!-- Bar 10: Reverse B70 + XTX HIP 5k+3k, static — 52.71 tok/s (w = 272.9) -->
+  <text x="298" y="487" text-anchor="end" class="label">Reverse B70 + 7900 XTX (5k+3k, static)</text>
+  <text x="298" y="501" text-anchor="end" class="sublabel">SYCL primary + HIP agent · CM off (2 cold salvages)</text>
+  <rect x="310" y="475" width="272.9" height="24" rx="4" fill="var(--bar-rev)"/>
+  <text x="590.9" y="491.5" class="val">52.71 tok/s</text>
+  <text x="667" y="491.5" class="delta-neg">-4.2% vs B70 5k</text>
 
   <!-- Footer -->
-  <text x="24" y="431" class="footer">Protocol: greedy, --spec 4 --spec-min-p 0.5 --max-context 8192 --prefill 512, prompt_deadlock_2744.tok (2,743 tokens), 64 generated. 64/64 exact parity verified.</text>
+  <text x="24" y="555" class="footer">Protocol: greedy, --spec 4 --spec-min-p 0.5 --max-context 8192 --prefill 512, prompt_deadlock_2744.tok (2,743 tokens), 64 generated. 64/64 exact parity verified.</text>
 </svg>

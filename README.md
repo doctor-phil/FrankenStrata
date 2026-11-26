@@ -35,15 +35,18 @@ FrankenStrata extends Strata (`v0.2.22`, engine `0.1.69`) with process-per-vendo
 
 Measured on an **AMD Ryzen 9 5900XT (64 GB DDR4)** + **AMD RX 7900 XTX 24 GB (`gfx1100`, HIP)** + **Intel Arc Pro B70 32 GB (`bmg-g31`, SYCL AOT)** running `Qwen3.8-Flash-Next Coder IQ1_M` (`prompt_deadlock_2744.tok`, 2,743 tokens, greedy, `--spec 4 --spec-min-p 0.5 --max-context 8192 --prefill 512`, 64 generated tokens):
 
-| Configuration (`v0.2.22` / engine `0.1.69`) | Decode tok/s | Prefill tok/s | Delta vs Solo 7900 XTX | Salvages |
+| Configuration (`v0.2.22` / engine `0.1.69`) | Decode tok/s | Prefill tok/s | Delta vs Solo Baseline | Salvages |
 | --- | ---: | ---: | ---: | ---: |
 | Solo Intel Arc Pro B70 32 GB (SYCL AOT, `12,288/12,288` resident) | **77.03** | 702.46 | — | — |
-| Mixed 7900 XTX + B70 (`auto` + 3,200 slots, cost-model on + `franken-profile`) | **76.57** | 938.96 | **+2.6%** vs auto | 0 |
-| Mixed 7900 XTX + B70 (`auto` + 3,200 slots, static / cost-model off) | **76.21** | 964.57 | **+2.2%** vs auto | 0 |
-| Solo AMD RX 7900 XTX 24 GB (HIP, `auto` = `9,121/12,288` slots) | **74.60** | 965.05 | baseline (auto) | — |
-| Mixed 7900 XTX + B70 (cap `5,000` + `3,000` slots, 3-tier dynamic + cost-model on) | **72.20** | 729.23 | **+9.5%** vs 5k cap | 0 |
-| Mixed 7900 XTX + B70 (cap `5,000` + `3,000` slots, static / cost-model off) | **70.86** | 738.17 | **+7.5%** vs 5k cap | 0 |
-| Solo AMD RX 7900 XTX 24 GB (HIP, cap `5,000/12,288` slots) | **65.94** | 715.50 | baseline (5k cap) | — |
+| Mixed 7900 XTX + B70 (`auto` + 3,200 slots, cost-model on + `franken-profile`) | **76.57** | 938.96 | **+2.6%** vs XTX auto | 0 |
+| Mixed 7900 XTX + B70 (`auto` + 3,200 slots, static / cost-model off) | **76.21** | 964.57 | **+2.2%** vs XTX auto | 0 |
+| Solo AMD RX 7900 XTX 24 GB (HIP, `auto` = `9,121/12,288` slots) | **74.60** | 965.05 | XTX auto baseline | — |
+| Mixed 7900 XTX + B70 (cap `5,000` + `3,000` slots, 3-tier dynamic + cost-model on) | **72.20** | 729.23 | **+9.5%** vs XTX 5k | 0 |
+| Mixed 7900 XTX + B70 (cap `5,000` + `3,000` slots, static / cost-model off) | **70.86** | 738.17 | **+7.5%** vs XTX 5k | 0 |
+| Solo AMD RX 7900 XTX 24 GB (HIP, `--expert-cache 5000`) | **65.94** | 715.50 | XTX 5k baseline | — |
+| Reverse Mixed B70 + 7900 XTX HIP (cap `5,000` + `3,000` slots, 3-tier dynamic + CM on) | **59.09** | 273.49 | **+7.4%** vs B70 5k | 1 |
+| Solo Intel Arc Pro B70 32 GB (SYCL AOT, `--expert-cache 5000`) | **55.00** | 273.08 | B70 5k baseline | — |
+| Reverse Mixed B70 + 7900 XTX HIP (cap `5,000` + `3,000` slots, static / CM off) | **52.71** | 273.61 | -4.2% vs B70 5k | 2 |
 
 All capped and deterministic (`STRATA_PREFILL_CPU_SHARE=0`) mixed configurations match solo **64/64** tokens identically, and mid-generation `SIGKILL` of the SYCL agent falls back cleanly to host CPU with zero hangs or NaNs. See **[FRANKENSTRATA.md](FRANKENSTRATA.md)** for full architecture, profiler, dynamic controller, boxed Linux packaging, and usage.
 
