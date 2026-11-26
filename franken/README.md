@@ -27,6 +27,11 @@ Design references are to `DESIGN.md` in Philip's research notes
 | `control/tier_controller.{hpp,cpp}` | Dynamic multi-tier controller: distinct-expert online latency cost model (`--franken-cost-model on\|off`, seeded via `--franken-profile`), deduplication `DEMOTE`, Primary-evicted cascade into Agent VRAM, and move-cost-gated (`(h_in-h_out)*H_eff*(w_src-w_m) > kappa*C_move_ms`) hot CPU-miss swaps (`--franken-adapt-swaps N`). |
 | `tests/franken_phase2_test.cpp` | GPU-less Phase 2 unit tests: `HwProfile` JSON round-trip, `recommend_tier_plan` ordering, live cross-process `PROMOTE`/`DEMOTE`/`RESYNC` over shm, cascade swap planner, and online cost-model gating. |
 | `tests/franken_phase3_test.cpp` | GPU-less Phase 3 unit tests: `q8_1` host quantizer (accuracy, zero block, `kHalfMax` clamp), `q8_1` + compact row negotiation & FP32/v1 fallback, non-blocking async `PROMOTE` concurrency + `C_move_ms`, and economic move-cost break-even gate. |
+| `launcher/franken_launch.py` | Phase 4 unified mixed-hardware launcher & `AgentSupervisor`: Linux AMD/Intel/NVIDIA GPU discovery, `franken-hw-profile.json` / `--profile` / `--reprofile`, native bundled or Docker SYCL agent supervision, and guaranteed process-group + `/dev/shm` cleanup (`strata franken ...` / `franken-strata`). |
+| `../packaging/package_franken.py`, `../packaging/build_franken_linux.sh` | Phase 4 boxed Linux packager staging self-contained `hip/` (TheRock), `sycl/` (oneAPI/Level-Zero UR), `bin/` (`franken-agent-cpu`, `franken-profile`), `launcher/`, `franken-strata`, and `BUILD.json` with `RUNPATH $ORIGIN` and `binary_deps.py` verification. |
+| `../tests/terminal/test_franken_launcher.py` | Phase 4 `pytest` unit tests covering GPU discovery, tier plan selection, native/Docker command assembly, and supervisor teardown + `/dev/shm` cleanup. |
+
+See **[FRANKENSTRATA.md](../FRANKENSTRATA.md)** for full architecture, quick start, and measured benchmark tables.
 
 ## Build & verification commands (run on hardware rig)
 

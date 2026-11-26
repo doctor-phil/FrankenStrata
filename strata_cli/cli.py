@@ -106,6 +106,9 @@ def parser() -> argparse.ArgumentParser:
 
     repair = sp.add_parser("repair-access", help="give you back Strata files that a run as administrator locked (Windows)")
     repair.add_argument("--output", choices=("human", "json"), default="human")
+    franken_p = sp.add_parser("franken", add_help=False,
+                              help="FrankenStrata mixed-hardware launcher (opt-in multi-vendor GPU orchestration)")
+    franken_p.add_argument("franken_args", nargs=argparse.REMAINDER)
     doctor = sp.add_parser("doctor", help="read-only check of installed engine components")
     doctor.add_argument("--profile", help="saved profile name or run config JSON path")
     doctor.add_argument("--components", action="store_true", help="include component inventory (default)")
@@ -2124,6 +2127,9 @@ def _run(a: argparse.Namespace) -> int:
             return _install(a)
         if a.command == "repair-access":
             return _repair_access(a)
+        if a.command == "franken":
+            from franken.launcher.franken_launch import main as franken_main
+            return franken_main(list(getattr(a, "franken_args", []) or []))
         if a.command == "profile":
             return _profile_command(a)
         if a.command == "components" and a.components_command == "plan":

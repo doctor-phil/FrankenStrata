@@ -24,6 +24,8 @@
 
 **Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
 
+> **FrankenStrata fork (mixed-vendor multi-GPU on Linux):** This fork adds process-per-vendor expert tiering over POSIX shared memory so GPUs from different vendors work together on one MoE model — verified on an **AMD RX 7900 XTX (24 GB, HIP) + Intel Arc Pro B70 (32 GB, SYCL)** rig with `Qwen3.8-Flash-Next Coder IQ1_M` (**64/64 exact token parity**, up to **+9.0%** decode at full VRAM and **+16.3%** / **+14.8%** dynamic 3-tier speedup when primary VRAM is capped, plus zero-hang `SIGKILL` CPU fallback). Stock single-vendor Strata behavior is unchanged unless `--franken-agent` or `franken-strata` is used. See **[FRANKENSTRATA.md](FRANKENSTRATA.md)** for architecture, quick start, boxed packaging, and measured benchmarks.
+
 ## Models
 
 We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.
@@ -159,6 +161,7 @@ Follow the prompts to download and start a model. [Terminal guide](docs/TERMINAL
 | **Apple Silicon · M1 or newer** | [Mac setup](docs/MAC.md) |
 | **AMD Ryzen AI Max · Strix Halo** | [Strix Halo setup](docs/STRIX_HALO.md) |
 | **NVIDIA DGX Spark · Linux** | [DGX Spark setup](docs/DGX_SPARK_LINUX.md) |
+| **Mixed-vendor GPUs (AMD HIP + Intel SYCL / CUDA / CPU) · Linux** | [FrankenStrata guide](FRANKENSTRATA.md) |
 
 <a id="using-it"></a>
 

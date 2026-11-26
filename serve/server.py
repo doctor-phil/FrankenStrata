@@ -1073,11 +1073,49 @@ class StrataEngine:
                   "STRATA_ENGINE_NICE=0 turns it off)", flush=True)
         end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
         spawned_at = time.monotonic()
+        self._franken_sup = None
+        if isinstance(cfg, dict) and isinstance(cfg.get("franken"), dict) and cfg["franken"].get("enabled", True):
+            # Opt-in FrankenStrata mixed-hardware agent supervision for `serve`: untouched unless "franken" is in config.
+            from franken.launcher.franken_launch import (
+                AgentLaunchSpec, AgentSupervisor, LaunchPlan, build_primary_franken_args,
+            )
+            fcfg = cfg["franken"]
+            f_specs = []
+            for idx, item in enumerate(fcfg.get("agents") or []):
+                f_specs.append(AgentLaunchSpec(
+                    vendor=str(item.get("vendor", "sycl")).lower(),
+                    device_index=int(item.get("device", 0)),
+                    shm_name=str(item.get("shm", f"/franken_serve_{os.getpid()}_{idx}")),
+                    slots=int(item.get("slots", 0)),
+                    use_docker=bool(item.get("docker", False)),
+                    docker_image=str(item.get("docker_image", "strata-sycl-dev:latest")),
+                    binary=Path(item["binary"]) if item.get("binary") else None,
+                ))
+            if f_specs:
+                f_pack = fcfg.get("pack") or (args[args.index("--pack") + 1] if "--pack" in args[:-1] else "")
+                f_native = fcfg.get("native") or (args[args.index("--native") + 1] if "--native" in args[:-1] else None)
+                f_plan = LaunchPlan(
+                    primary=None,
+                    agents=f_specs,
+                    profile_path=Path(fcfg["hw_profile"]) if fcfg.get("hw_profile") else None,
+                    cost_model=str(fcfg.get("cost_model", "on")),
+                    adapt_swaps=fcfg.get("adapt_swaps"),
+                    deadline_ms=fcfg.get("deadline_ms"),
+                )
+                args = [*args, *build_primary_franken_args(f_plan)]
+                self._franken_sup = AgentSupervisor(
+                    f_specs, pack_dir=str(f_pack), native_gguf=f_native,
+                    bundle_dir=Path(fcfg["bundle_dir"]) if fcfg.get("bundle_dir") else None,
+                )
+                self._franken_sup.start()
         try:
             self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env,
                               **pin)
         except OSError:                                  # nothing started: the narrator stops, the log handle goes back
+            if self._franken_sup is not None:
+                self._franken_sup.stop()
+                self._franken_sup = None
             loading.set()
             if log:
                 self.log.close()
@@ -2652,6 +2690,12 @@ class StrataEngine:
         except OSError:
             pass
         finally:
+            if getattr(self, "_franken_sup", None) is not None:
+                try:
+                    self._franken_sup.stop()
+                except Exception:
+                    pass
+                self._franken_sup = None
             if self.proc.poll() is not None:
                 if self.pump is not None and self.pump.ident is not None:   # a restart can stop before starting it
                     self.pump.join(timeout=2)
