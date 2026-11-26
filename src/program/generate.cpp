@@ -18963,8 +18963,8 @@ int main(int argc, char** argv) {
                 const auto& ag = franken_tiers[ai];
                 const auto& am = franken_ctrl.agent_model(ai);
                 std::printf("%-24s [%s/%s] state=%s resident=%lld entries=%llu rounds=%llu/%llu salvaged=%llu "
-                            "promotes=%llu/%llu demotes=%llu launch=%.3f wait=%.3f copy=%.3f ms/round "
-                            "fit=%.3f+%.3f*n ms\n",
+                            "q8_1=%d compact=%d promotes=%llu/%llu demotes=%llu c_move=%.3f ms "
+                            "launch=%.3f wait=%.3f copy=%.3f ms/round fit=%.3f+%.3f*n ms\n",
                             "franken agent", ag->shm_name().c_str(), ag->vendor_str(),
                             ag->alive() ? "Ready" : "Dead",
                             (long long) ag->resident(),
@@ -18972,16 +18972,18 @@ int main(int argc, char** argv) {
                             (unsigned long long) ag->rounds_done(),
                             (unsigned long long) ag->rounds_launched(),
                             (unsigned long long) ag->rounds_salvaged(),
+                            ag->uses_q8_1() ? 1 : 0, ag->uses_compact_rows() ? 1 : 0,
                             (unsigned long long) ag->promotes_acked(),
                             (unsigned long long) ag->promotes_sent(),
                             (unsigned long long) ag->demotes_sent(),
+                            franken_ctrl.agent_c_move_ms(ai),
                             rounds > 0 ? ag->ms_launch() / rounds : 0.0,
                             rounds > 0 ? ag->ms_wait() / rounds : 0.0,
                             rounds > 0 ? ag->ms_copy() / rounds : 0.0,
                             am.a, am.b);
             }
             std::printf("%-24s cost_model=%s gated=%llu rounds (%llu entries) adapt_rounds=%llu "
-                        "dedup=%llu cascade=%llu miss_promotes=%llu cpu_fit=%.3f+%.3f*n ms\n",
+                        "dedup=%llu cascade=%llu miss_promotes=%llu move_rej=%llu cpu_fit=%.3f+%.3f*n ms\n",
                         "franken control", franken_ctrl.cost_model_enabled() ? "on" : "off",
                         (unsigned long long) franken_ctrl.gated_rounds(),
                         (unsigned long long) franken_ctrl.gated_entries(),
@@ -18989,6 +18991,7 @@ int main(int argc, char** argv) {
                         (unsigned long long) franken_ctrl.dedup_demotes(),
                         (unsigned long long) franken_ctrl.cascade_promotes(),
                         (unsigned long long) franken_ctrl.miss_promotes(),
+                        (unsigned long long) franken_ctrl.move_cost_rejected(),
                         franken_ctrl.cpu_model().a, franken_ctrl.cpu_model().b);
         }
 #endif

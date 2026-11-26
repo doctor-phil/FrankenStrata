@@ -5186,31 +5186,51 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (use_franken) {
         int32_t fkind[kMaxWindowEntries];
         const bool single_agent = d.franken_agents.size() == 1;
-        int32_t cur_cpu_entries = 0;
-        for (int64_t i = 0; i < n; ++i)
-            if (kind[i] == -1) ++cur_cpu_entries;
+        const bool layer_q8_1_ok = native && !lay.fmt[(size_t) d.layers].had_gu;
+        int32_t cur_cpu_distinct = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            if (kind[i] != -1) continue;
+            bool seen = false;
+            for (int64_t j = 0; j < i; ++j)
+                if (kind[j] == -1 && ids[j] == ids[i]) { seen = true; break; }
+            if (!seen) ++cur_cpu_distinct;
+        }
         for (size_t a = 0; a < d.franken_agents.size(); ++a) {
             auto* ag = d.franken_agents[a];
             if (ag == nullptr) continue;
-            int32_t n_for_a = 0;
+            int32_t n_for_a = 0, n_distinct_a = 0;
             const int32_t* kptr = kind;
             if (single_agent) {
-                for (int64_t i = 0; i < n; ++i)
-                    if (franken_owner[i] == 0) ++n_for_a;
+                for (int64_t i = 0; i < n; ++i) {
+                    if (franken_owner[i] != 0) continue;
+                    ++n_for_a;
+                    bool seen = false;
+                    for (int64_t j = 0; j < i; ++j)
+                        if (franken_owner[j] == 0 && ids[j] == ids[i]) { seen = true; break; }
+                    if (!seen) ++n_distinct_a;
+                }
             } else {
                 for (int64_t i = 0; i < n; ++i) {
-                    if (franken_owner[i] == (int32_t) a) { fkind[i] = 3; ++n_for_a; }
-                    else fkind[i] = (kind[i] == 3 ? -1 : kind[i]);
+                    if (franken_owner[i] == (int32_t) a) {
+                        fkind[i] = 3;
+                        ++n_for_a;
+                        bool seen = false;
+                        for (int64_t j = 0; j < i; ++j)
+                            if (franken_owner[j] == (int32_t) a && ids[j] == ids[i]) { seen = true; break; }
+                        if (!seen) ++n_distinct_a;
+                    } else {
+                        fkind[i] = (kind[i] == 3 ? -1 : kind[i]);
+                    }
                 }
                 kptr = fkind;
             }
             if (n_for_a == 0) continue;
-            // Phase 2 cost-model gating: keep tiny high-IPC-overhead batches on CPU when faster.
+            // Phase 2/3 cost-model gating (keyed on distinct experts): keep tiny high-IPC batches on CPU when faster.
             const bool gated = d.franken_controller != nullptr &&
-                               !d.franken_controller->should_dispatch_agent(a, n_for_a, cur_cpu_entries);
-            if (gated || !ag->launch(d.layers, x_f, ids, n_tok, k, kptr)) {
+                               !d.franken_controller->should_dispatch_agent(a, n_distinct_a, cur_cpu_distinct, n_for_a);
+            if (gated || !ag->launch(d.layers, x_f, ids, n_tok, k, kptr, layer_q8_1_ok)) {
                 if (gated) d.franken_gated_entries += n_for_a;
-                cur_cpu_entries += n_for_a;
+                cur_cpu_distinct += n_distinct_a;
                 for (int64_t i = 0; i < n; ++i) {
                     if (franken_owner[i] == (int32_t) a) {
                         franken_owner[i] = -1;
@@ -5485,7 +5505,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             auto* ag = d.franken_agents[a];
             if (ag != nullptr && ag->launched()) {
                 if (ag->finish(out, salvaged) && d.franken_controller != nullptr) {
-                    d.franken_controller->observe_agent(a, ag->last_round_entries(), ag->last_round_ms());
+                    d.franken_controller->observe_agent(a, ag->last_round_distinct(), ag->last_round_ms());
                 }
             }
         }

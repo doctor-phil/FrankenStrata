@@ -57,6 +57,15 @@ struct AgentResidencySnapshot {
     uint32_t max_slots = 0;
     size_t pending_promotes = 0;
     const std::vector<uint8_t>* resident = nullptr;  // size n_layers * n_expert
+    // Phase 3 move-cost economic break-even parameters (enabled when enabled == true
+    // and c_move_ms > 0): promote only if (h_in - h_out) * h_eff * (w_src_ms - w_m_ms)
+    // > kappa * c_move_ms. When disabled (models not ready yet), falls back to min_gain.
+    bool move_cost_ready = false;
+    double w_src_ms = 0.0;    // marginal per-expert latency on source tier (CPU)
+    double w_m_ms = 0.0;      // marginal per-expert latency on this agent tier
+    double c_move_ms = 0.0;   // measured/estimated PROMOTE transfer cost (ms)
+    double h_eff = 10.0;      // effective horizon multiplier (~1/(1-decay))
+    double kappa = 1.0;       // break-even safety margin
 };
 
 struct CascadeOp {
@@ -72,6 +81,7 @@ struct CascadeOp {
 
 struct CascadePlan {
     std::vector<CascadeOp> ops;
+    uint64_t move_cost_rejected = 0;
 };
 
 // Deterministically plans deduplication demotions, Primary-evicted cascades,
@@ -108,12 +118,14 @@ public:
     bool cost_model_enabled() const { return cost_model_enabled_; }
 
     // Online latency gating consulted by expert_pool_dispatch_multi before launching
-    // agent `agent_idx` for `n_agent_entries` entries alongside `n_cpu_misses` CPU entries.
-    bool should_dispatch_agent(size_t agent_idx, int32_t n_agent_entries, int32_t n_cpu_misses);
+    // agent `agent_idx` for `n_agent_distinct` distinct experts alongside `n_cpu_distinct`
+    // distinct CPU experts (passing `n_agent_entries` for telemetry).
+    bool should_dispatch_agent(size_t agent_idx, int32_t n_agent_distinct, int32_t n_cpu_distinct,
+                               int32_t n_agent_entries = -1);
 
-    // Online timing updates called after each layer completes.
-    void observe_agent(size_t agent_idx, int32_t n_entries, double elapsed_ms);
-    void observe_cpu(int32_t n_entries, double elapsed_ms);
+    // Online timing updates called after each layer completes (keyed on distinct experts).
+    void observe_agent(size_t agent_idx, int32_t n_distinct, double elapsed_ms);
+    void observe_cpu(int32_t n_distinct, double elapsed_ms);
     void observe_primary(double elapsed_ms);
 
     // Non-blocking poll of control acks across all agents (triggers resync if needed).
@@ -129,6 +141,7 @@ public:
     // Diagnostics & counters
     const LinearLatencyModel& cpu_model() const { return cpu_model_; }
     const LinearLatencyModel& agent_model(size_t idx) const { return agent_models_[idx]; }
+    double agent_c_move_ms(size_t idx) const;
     double primary_ms() const { return primary_ms_; }
     uint64_t gated_rounds() const { return gated_rounds_; }
     uint64_t gated_entries() const { return gated_entries_; }
@@ -136,6 +149,7 @@ public:
     uint64_t dedup_demotes() const { return dedup_demotes_; }
     uint64_t cascade_promotes() const { return cascade_promotes_; }
     uint64_t miss_promotes() const { return miss_promotes_; }
+    uint64_t move_cost_rejected() const { return move_cost_rejected_; }
 
 private:
     int32_t n_layers_ = 0;
@@ -146,6 +160,7 @@ private:
 
     LinearLatencyModel cpu_model_{};
     std::vector<LinearLatencyModel> agent_models_;
+    std::vector<double> seeded_c_move_ms_;
     double primary_ms_ = 0.0;
     int64_t primary_samples_ = 0;
     uint32_t explore_counter_ = 0;
@@ -156,6 +171,7 @@ private:
     uint64_t dedup_demotes_ = 0;
     uint64_t cascade_promotes_ = 0;
     uint64_t miss_promotes_ = 0;
+    uint64_t move_cost_rejected_ = 0;
 };
 
 }  // namespace control

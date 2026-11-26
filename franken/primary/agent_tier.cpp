@@ -155,7 +155,7 @@ bool AgentTier::send_promote(int32_t layer, int32_t expert) {
         return false;
     }
     // Safe by construction: stays non-routable until matching PromoteAck lands.
-    pending_promotes_[idx] = PendingPromote{layer, expert, next_gen, msg.seq};
+    pending_promotes_[idx] = PendingPromote{layer, expert, next_gen, msg.seq, fi::now_ns()};
     fi::futex_wake_u64_low(&seg_.control()->doorbell_seq.value);
     ++promotes_sent_;
     return true;
@@ -185,6 +185,19 @@ bool AgentTier::poll_control_acks() {
                     pending_promotes_.erase(it);
                     break;
                 }
+                const uint64_t now = fi::now_ns();
+                // Subtract batch queueing delay when multiple promotes were enqueued together.
+                const uint64_t eff_start = std::max(it->second.send_time_ns, last_promote_ack_ns_);
+                if (now >= eff_start) {
+                    const double move_ms = double(now - eff_start) / 1e6;
+                    if (move_samples_ < 16) {
+                        c_move_ms_ += (move_ms - c_move_ms_) / double(++move_samples_);
+                    } else {
+                        c_move_ms_ += 0.1 * (move_ms - c_move_ms_);
+                        ++move_samples_;
+                    }
+                }
+                last_promote_ack_ns_ = now;
                 pending_promotes_.erase(it);
                 if (resident_[size_t(idx)] == 0) {
                     resident_[size_t(idx)] = 1;
@@ -371,6 +384,13 @@ bool AgentTier::open(const AgentSpec& spec,
         return false;
     }
 
+    const bool no_q8 = std::getenv("STRATA_FRANKEN_NO_Q8_1") != nullptr &&
+                       std::atoi(std::getenv("STRATA_FRANKEN_NO_Q8_1")) != 0;
+    const bool no_compact = std::getenv("STRATA_FRANKEN_NO_COMPACT") != nullptr &&
+                            std::atoi(std::getenv("STRATA_FRANKEN_NO_COMPACT")) != 0;
+    use_q8_1_ = !no_q8 && ((caps_.feature_flags & fw::kCapQ8_1Activations) != 0);
+    use_compact_rows_ = !no_compact && ((caps_.feature_flags & fw::kCapCompactRows) != 0);
+
     const uint32_t slot_budget =
         spec.max_slots > 0 ? std::min(caps_.slot_count, spec.max_slots) : caps_.slot_count;
 
@@ -420,11 +440,13 @@ bool AgentTier::open(const AgentSpec& spec,
         close();
         return false;
     }
+    const uint64_t open_t0_ns = fi::now_ns();
     fi::futex_wake_u64_low(&seg_.control()->doorbell_seq.value);
 
     std::fprintf(stderr,
-                 "strata franken-agent [%s/%s]: HELLO ok (advertised %u slots); sent OPEN (%zu experts)...\n",
-                 seg_.name().c_str(), vendor_str(), caps_.slot_count, fill.size());
+                 "strata franken-agent [%s/%s]: HELLO ok (advertised %u slots, q8_1=%d compact=%d); sent OPEN (%zu experts)...\n",
+                 seg_.name().c_str(), vendor_str(), caps_.slot_count,
+                 use_q8_1_ ? 1 : 0, use_compact_rows_ ? 1 : 0, fill.size());
 
     // 3. Wait for OPEN_ACK while monitoring agent heartbeat / fatal errors.
     hb_.reset(seg_.control()->heartbeat.value.load(std::memory_order_acquire));
@@ -466,9 +488,18 @@ bool AgentTier::open(const AgentSpec& spec,
     }
 
     // 4. Install resident bitmap from OPEN_ACK and mark those experts claimed.
+    const uint64_t open_t1_ns = fi::now_ns();
+    open_fill_ms_ = double(open_t1_ns - open_t0_ns) / 1e6;
     if (!install_bitmap(open_ack.bitmap_offset, open_ack.gen, &claimed, err)) {
         close();
         return false;
+    }
+    open_fill_bytes_ = 0;
+    for (int64_t l = 0; l < n_layers_; ++l) {
+        const uint64_t bb = blob_bytes[size_t(l)];
+        for (int64_t e = 0; e < n_expert_; ++e) {
+            if (resident_[size_t(l * n_expert_ + e)] != 0) open_fill_bytes_ += bb;
+        }
     }
     allocated_slots_ = uint32_t(resident_count_);
     pending_promotes_.clear();
@@ -522,9 +553,12 @@ bool AgentTier::launch(int64_t layer,
                        const int32_t* ids,
                        int64_t n_tok,
                        int64_t k,
-                       const int32_t* kind) {
+                       const int32_t* kind,
+                       bool allow_q8_1) {
     launched_ = false;
     launched_entries_.clear();
+    active_distinct_ = 0;
+    active_compact_out_ = false;
     if (!alive_) return false;
 
     drain_error_acks();
@@ -533,13 +567,22 @@ bool AgentTier::launch(int64_t layer,
 
     const int64_t n = n_tok * k;
     for (int64_t i = 0; i < n; ++i) {
-        if (kind[i] == 3) launched_entries_.push_back(int32_t(i));
+        if (kind[i] != 3) continue;
+        launched_entries_.push_back(int32_t(i));
+        bool seen = false;
+        for (int64_t j = 0; j < i; ++j) {
+            if (kind[j] == 3 && ids[j] == ids[i]) { seen = true; break; }
+        }
+        if (!seen) ++active_distinct_;
     }
     if (launched_entries_.empty()) return false;
 
     const uint64_t t0 = fi::now_ns();
     const uint64_t seq = ++next_doorbell_seq_;
     fw::DescriptorHeader* dh = seg_.descriptor(seq);
+
+    const bool send_q8_1 = use_q8_1_ && allow_q8_1 && ((n_embd_ & 31) == 0);
+    const bool compact_out = use_compact_rows_;
 
     const uint64_t budget_ns = compute_deadline_ns();
     dh->payload_kind = uint32_t(fw::PayloadKind::ExpertRows);
@@ -549,10 +592,17 @@ bool AgentTier::launch(int64_t layer,
     dh->k = int32_t(k);
     dh->n_agent_entries = int32_t(launched_entries_.size());
     dh->deadline_hint_ns = budget_ns;
+    dh->flags = (send_q8_1 ? fw::kDescFlagActQ8_1 : 0u) |
+                (compact_out ? fw::kDescFlagCompactOut : 0u);
 
     std::memcpy(fw::slot_ids(dh), ids, size_t(n) * sizeof(int32_t));
     std::memcpy(fw::slot_kind(dh), kind, size_t(n) * sizeof(int32_t));
-    std::memcpy(fw::slot_x(dh), x, size_t(n_tok) * size_t(n_embd_) * sizeof(float));
+    if (send_q8_1) {
+        fi::quantize_q8_1_rows_host(x, int32_t(n_tok), int32_t(n_embd_),
+                                    reinterpret_cast<uint8_t*>(fw::slot_x(dh)));
+    } else {
+        std::memcpy(fw::slot_x(dh), x, size_t(n_tok) * size_t(n_embd_) * sizeof(float));
+    }
 
     dh->state.store(uint32_t(fw::SlotState::Published), std::memory_order_release);
     seg_.control()->doorbell_seq.value.store(seq, std::memory_order_release);
@@ -561,6 +611,7 @@ bool AgentTier::launch(int64_t layer,
     const uint64_t t1 = fi::now_ns();
     ms_launch_ += double(t1 - t0) / 1e6;
     active_seq_ = seq;
+    active_compact_out_ = compact_out;
     launch_start_ns_ = t1;
     active_deadline_ns_ = t1 + budget_ns;
     launched_ = true;
@@ -589,15 +640,24 @@ bool AgentTier::finish(float* out, std::vector<int32_t>& salvaged_entries) {
 
         const float* row_arena = seg_.row_slot(active_seq_);
         const size_t row_bytes = size_t(n_embd_) * sizeof(float);
-        for (int32_t entry : launched_entries_) {
-            std::memcpy(out + size_t(entry) * size_t(n_embd_),
-                        row_arena + size_t(entry) * size_t(n_embd_),
-                        row_bytes);
+        if (active_compact_out_) {
+            for (size_t r = 0; r < launched_entries_.size(); ++r) {
+                std::memcpy(out + size_t(launched_entries_[r]) * size_t(n_embd_),
+                            row_arena + r * size_t(n_embd_),
+                            row_bytes);
+            }
+        } else {
+            for (int32_t entry : launched_entries_) {
+                std::memcpy(out + size_t(entry) * size_t(n_embd_),
+                            row_arena + size_t(entry) * size_t(n_embd_),
+                            row_bytes);
+            }
         }
         const uint64_t tc1 = fi::now_ns();
         ms_copy_ += double(tc1 - tw1) / 1e6;
         last_round_ms_ = double(tc1 - launch_start_ns_) / 1e6;
         last_round_entries_ = int32_t(launched_entries_.size());
+        last_round_distinct_ = active_distinct_;
         ++rounds_done_;
         entries_served_ += uint64_t(launched_entries_.size());
         return true;

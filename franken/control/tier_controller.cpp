@@ -162,14 +162,34 @@ CascadePlan plan_cascade_swaps(int32_t n_layers,
         });
     }
 
+    // Phase 3 economic break-even gate:
+    //   (h_in - h_out) * H_eff * (w_src - w_m) > kappa * C_move_ms
+    // Falls back to plain hysteresis (min_gain) when move_cost_ready is false.
+    auto passes_move_cost = [&](size_t a, float delta_h) -> bool {
+        const AgentResidencySnapshot& s = agents[a];
+        if (!s.move_cost_ready || s.c_move_ms <= 0.0) return true;
+        const double delta_w = s.w_src_ms - s.w_m_ms;
+        if (delta_w <= 0.0) {
+            ++plan.move_cost_rejected;
+            return false;
+        }
+        const double benefit_ms = double(delta_h) * s.h_eff * delta_w;
+        const double threshold_ms = s.kappa * s.c_move_ms;
+        if (benefit_ms > threshold_ms) return true;
+        ++plan.move_cost_rejected;
+        return false;
+    };
+
     // Helper: attempt to place candidate (l, e, h) onto agent `a`, preferring
-    // a free slot first, else evicting the coldest victim if gain >= min_gain.
+    // a free slot first, else evicting the coldest victim if gain >= min_gain
+    // and the economic move-cost break-even gate passes.
     auto try_place_on_agent = [&](size_t a, int32_t l, int32_t e, float h, bool from_primary) -> bool {
         if (res[a].empty() || swaps_used[a] >= max_swaps_per_agent) return false;
         const size_t idx = size_t(l) * size_t(n_expert) + size_t(e);
         if (in_primary[idx] || any_agent_holds(idx)) return false;
 
         if (free_slots[a] > 0) {
+            if (!passes_move_cost(a, h)) return false;
             --free_slots[a];
             res[a][idx] = 1;
             ++swaps_used[a];
@@ -191,6 +211,7 @@ CascadePlan plan_cascade_swaps(int32_t n_layers,
                 continue;
             }
             if (h < v.h + min_gain) return false;
+            if (!passes_move_cost(a, h - v.h)) return false;
             ++victim_cursor[a];
             res[a][vidx] = 0;
             res[a][idx] = 1;
@@ -274,6 +295,13 @@ void TierController::init(int32_t n_layers,
     max_swaps_per_agent_ = max_swaps_per_agent;
     cpu_model_ = LinearLatencyModel{};
     agent_models_.assign(agents.size(), LinearLatencyModel{});
+    seeded_c_move_ms_.assign(agents.size(), 0.0);
+    for (size_t i = 0; i < agents.size(); ++i) {
+        if (agents[i] != nullptr && agents[i]->open_fill_ms() > 0.0 && agents[i]->resident() > 0) {
+            // Seed initial per-blob move cost from observed OPEN fill duration.
+            seeded_c_move_ms_[i] = agents[i]->open_fill_ms() / double(agents[i]->resident());
+        }
+    }
     primary_ms_ = 0.0;
     primary_samples_ = 0;
     explore_counter_ = 0;
@@ -283,22 +311,29 @@ void TierController::init(int32_t n_layers,
     dedup_demotes_ = 0;
     cascade_promotes_ = 0;
     miss_promotes_ = 0;
+    move_cost_rejected_ = 0;
 }
 
 void TierController::seed_from_profile(const profiler::HwProfile& prof) {
     if (prof.cpu.ms_base > 0.0 || prof.cpu.ms_per_expert > 0.0) {
         cpu_model_.seed(prof.cpu.ms_base, prof.cpu.ms_per_expert, /*weight=*/4.0);
     }
+    const double avg_blob_b = prof.avg_blob_bytes > 0 ? double(prof.avg_blob_bytes) : 2048000.0;
     for (size_t i = 0; i < agents_.size(); ++i) {
         if (agents_[i] == nullptr) continue;
         const profiler::GpuProfile* gp =
             profiler::find_gpu_profile(prof, agents_[i]->shm_name(), agents_[i]->vendor_str());
-        if (gp != nullptr && (gp->a_ipc_ms > 0.0 || gp->b_per_expert_ms > 0.0)) {
-            agent_models_[i].seed(gp->a_ipc_ms, gp->b_per_expert_ms, /*weight=*/4.0);
+        if (gp != nullptr) {
+            if (gp->a_ipc_ms > 0.0 || gp->b_per_expert_ms > 0.0) {
+                agent_models_[i].seed(gp->a_ipc_ms, gp->b_per_expert_ms, /*weight=*/4.0);
+            }
+            if (gp->pcie_h2d_gbps > 0.0) {
+                seeded_c_move_ms_[i] = avg_blob_b / (gp->pcie_h2d_gbps * 1e6);
+            }
             std::fprintf(stderr,
-                         "strata franken-control: seeded agent[%zu] (%s/%s) prior T(n) = %.3f + %.3f * n ms\n",
+                         "strata franken-control: seeded agent[%zu] (%s/%s) prior T(n)=%.3f+%.3f*n ms, C_move=%.3f ms\n",
                          i, agents_[i]->shm_name().c_str(), agents_[i]->vendor_str(),
-                         gp->a_ipc_ms, gp->b_per_expert_ms);
+                         agent_models_[i].a, agent_models_[i].b, seeded_c_move_ms_[i]);
         }
     }
     if (cpu_model_.seeded) {
@@ -307,10 +342,18 @@ void TierController::seed_from_profile(const profiler::HwProfile& prof) {
     }
 }
 
+double TierController::agent_c_move_ms(size_t idx) const {
+    if (idx < agents_.size() && agents_[idx] != nullptr && agents_[idx]->move_samples() > 0) {
+        return agents_[idx]->c_move_ms();
+    }
+    return idx < seeded_c_move_ms_.size() ? seeded_c_move_ms_[idx] : 0.0;
+}
+
 bool TierController::should_dispatch_agent(size_t agent_idx,
-                                           int32_t n_agent_entries,
-                                           int32_t n_cpu_misses) {
-    if (n_agent_entries <= 0) return false;
+                                           int32_t n_agent_distinct,
+                                           int32_t n_cpu_distinct,
+                                           int32_t n_agent_entries) {
+    if (n_agent_distinct <= 0) return false;
     if (!cost_model_enabled_ || agent_idx >= agent_models_.size()) return true;
 
     const LinearLatencyModel& am = agent_models_[agent_idx];
@@ -319,9 +362,9 @@ bool TierController::should_dispatch_agent(size_t agent_idx,
     // Periodic exploration so online fits keep observing agent latency even if usually gated.
     if ((++explore_counter_ & 63u) == 0) return true;
 
-    const double t_agent = am.predict(n_agent_entries);
-    const double t_cpu_with = cpu_model_.predict(n_cpu_misses);
-    const double t_cpu_without = cpu_model_.predict(n_cpu_misses + n_agent_entries);
+    const double t_agent = am.predict(n_agent_distinct);
+    const double t_cpu_with = cpu_model_.predict(n_cpu_distinct);
+    const double t_cpu_without = cpu_model_.predict(n_cpu_distinct + n_agent_distinct);
 
     const double makespan_with = std::max({primary_ms_, t_agent, t_cpu_with});
     const double makespan_without = std::max(primary_ms_, t_cpu_without);
@@ -330,7 +373,7 @@ bool TierController::should_dispatch_agent(size_t agent_idx,
         return true;
     }
     ++gated_rounds_;
-    gated_entries_ += uint64_t(n_agent_entries);
+    gated_entries_ += uint64_t(n_agent_entries > 0 ? n_agent_entries : n_agent_distinct);
     return false;
 }
 
@@ -376,11 +419,21 @@ void TierController::on_adapt_round(const std::vector<float>& usage,
         snaps[i].max_slots = agents_[i]->allocated_slots();
         snaps[i].pending_promotes = agents_[i]->pending_promote_count();
         snaps[i].resident = &agents_[i]->resident_table();
+        const double cmove = agent_c_move_ms(i);
+        if (cpu_model_.ready() && agent_models_[i].ready() && cmove > 0.0) {
+            snaps[i].move_cost_ready = true;
+            snaps[i].w_src_ms = cpu_model_.b;
+            snaps[i].w_m_ms = agent_models_[i].b;
+            snaps[i].c_move_ms = cmove;
+            snaps[i].h_eff = 10.0;
+            snaps[i].kappa = 1.0;
+        }
     }
 
     const CascadePlan plan = plan_cascade_swaps(
         n_layers_, n_expert_, usage, primary_res,
         primary_adopted, primary_evicted, snaps, max_swaps_per_agent_);
+    move_cost_rejected_ += plan.move_cost_rejected;
 
     for (const CascadeOp& op : plan.ops) {
         if (op.agent_idx >= agents_.size() || agents_[op.agent_idx] == nullptr) continue;

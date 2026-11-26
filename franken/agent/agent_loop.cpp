@@ -8,6 +8,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <unistd.h>
@@ -172,12 +173,92 @@ bool run_agent_loop(const AgentLoopConfig& cfg,
     }
 
     if (cfg.verbose) {
-        std::fprintf(stderr, "franken-agent (%s): posted HELLO (slots=%u max_t=%u max_e=%u)\n",
+        std::fprintf(stderr, "franken-agent (%s): posted HELLO (slots=%u max_t=%u max_e=%u caps=0x%x)\n",
                      vendor_name(caps.vendor), caps.slot_count,
-                     caps.max_tokens_per_window, caps.max_entries_per_window);
+                     caps.max_tokens_per_window, caps.max_entries_per_window, caps.feature_flags);
     }
 
+    // Background non-blocking PROMOTE refill thread (Phase 3): ensures blob I/O
+    // and H2D copies never stall compute doorbells on the main loop thread.
+    struct PromoteTask {
+        int32_t layer = 0;
+        int32_t expert = 0;
+        uint32_t gen = 0;
+        uint64_t ctrl_seq = 0;
+    };
+    std::mutex ack_mu;
+    std::mutex pairs_mu;
     std::vector<std::pair<int32_t, int32_t>> resident_pairs;
+
+    std::mutex refill_mu;
+    std::condition_variable refill_cv;
+    std::deque<PromoteTask> refill_queue;
+    bool refill_stop = false;
+    bool refill_busy = false;
+    std::pair<int32_t, int32_t> refill_active{-1, -1};
+    std::atomic<uint64_t> async_promotes_done{0};
+
+    auto push_ack_safe = [&](const wire::AckMsg& msg) {
+        std::lock_guard<std::mutex> lk(ack_mu);
+        (void)ipc::ring_push(*seg.ack_ring(), msg);
+    };
+    auto push_error_safe = [&](uint64_t seq, const std::string& msg, bool fatal) {
+        std::lock_guard<std::mutex> lk(ack_mu);
+        push_error_ack(seg, seq, msg, fatal);
+    };
+
+    std::thread refill_thread([&] {
+        std::unique_lock<std::mutex> lk(refill_mu);
+        while (true) {
+            refill_cv.wait(lk, [&] { return refill_stop || !refill_queue.empty(); });
+            if (refill_stop && refill_queue.empty()) break;
+            const PromoteTask task = refill_queue.front();
+            refill_queue.pop_front();
+            refill_busy = true;
+            refill_active = {task.layer, task.expert};
+            lk.unlock();
+
+            std::string perr;
+            if (backend.promote(task.layer, task.expert, perr)) {
+                {
+                    std::lock_guard<std::mutex> plk(pairs_mu);
+                    const auto pr = std::make_pair(task.layer, task.expert);
+                    if (std::find(resident_pairs.begin(), resident_pairs.end(), pr) ==
+                        resident_pairs.end()) {
+                        resident_pairs.push_back(pr);
+                    }
+                }
+                wire::AckMsg ack{};
+                ack.type = uint32_t(wire::AckType::PromoteAck);
+                ack.seq = task.ctrl_seq;
+                ack.promote_ack = {task.layer, task.expert, task.gen};
+                push_ack_safe(ack);
+                async_promotes_done.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                push_error_safe(task.ctrl_seq, perr, /*fatal=*/false);
+            }
+
+            lk.lock();
+            refill_busy = false;
+            refill_active = {-1, -1};
+            refill_cv.notify_all();
+        }
+    });
+
+    auto drain_refill = [&] {
+        std::unique_lock<std::mutex> lk(refill_mu);
+        refill_cv.wait(lk, [&] { return refill_queue.empty() && !refill_busy; });
+    };
+    auto stop_refill = [&] {
+        {
+            std::lock_guard<std::mutex> lk(refill_mu);
+            refill_stop = true;
+            refill_queue.clear();
+        }
+        refill_cv.notify_all();
+        if (refill_thread.joinable()) refill_thread.join();
+    };
+
     std::vector<float> staging_out(size_t(caps.max_entries_per_window) * size_t(g.n_embd), 0.0f);
     uint64_t last_seq = cb->doorbell_seq.value.load(std::memory_order_acquire);
     bool running = true;
@@ -195,10 +276,11 @@ bool run_agent_loop(const AgentLoopConfig& cfg,
         while (running && ipc::ring_pop(*seg.ctrl_ring(), cm)) {
             switch (static_cast<wire::CtrlType>(cm.type)) {
                 case wire::CtrlType::Open: {
+                    drain_refill();
                     const uint64_t pair_bytes = uint64_t(cm.open.n_fill) * 2ull * sizeof(int32_t);
                     if (!seg.var_range_ok(cm.open.fill_offset, pair_bytes)) {
                         err = "OPEN fill_offset out of segment bounds";
-                        push_error_ack(seg, cm.seq, err, /*fatal=*/true);
+                        push_error_safe(cm.seq, err, /*fatal=*/true);
                         ok = false;
                         running = false;
                         break;
@@ -211,23 +293,27 @@ bool run_agent_loop(const AgentLoopConfig& cfg,
                         req.emplace_back(raw_pairs[2 * i], raw_pairs[2 * i + 1]);
                     }
                     const uint64_t t0 = ipc::now_ns();
-                    resident_pairs.clear();
+                    std::vector<std::pair<int32_t, int32_t>> loaded;
                     std::string ferr;
-                    if (!backend.open_fill(req, resident_pairs, ferr)) {
+                    if (!backend.open_fill(req, loaded, ferr)) {
                         err = "OPEN fill failed: " + ferr;
-                        push_error_ack(seg, cm.seq, err, /*fatal=*/true);
+                        push_error_safe(cm.seq, err, /*fatal=*/true);
                         ok = false;
                         running = false;
                         break;
                     }
-                    write_resident_bitmap(seg, g.n_expert, resident_pairs);
+                    {
+                        std::lock_guard<std::mutex> plk(pairs_mu);
+                        resident_pairs = std::move(loaded);
+                        write_resident_bitmap(seg, g.n_expert, resident_pairs);
+                    }
                     wire::AckMsg ack{};
                     ack.type = uint32_t(wire::AckType::OpenAck);
                     ack.seq = cm.seq;
                     ack.open_ack.gen = cm.open.gen;
                     ack.open_ack.n_resident = uint32_t(resident_pairs.size());
                     ack.open_ack.bitmap_offset = seg.plan().agent_bitmap_offset;
-                    (void)ipc::ring_push(*seg.ack_ring(), ack);
+                    push_ack_safe(ack);
                     cb->agent_state.value.store(uint32_t(wire::AgentState::Ready),
                                                 std::memory_order_release);
                     if (cfg.verbose) {
@@ -240,49 +326,61 @@ bool run_agent_loop(const AgentLoopConfig& cfg,
                     break;
                 }
                 case wire::CtrlType::Promote: {
-                    std::string perr;
-                    if (backend.promote(cm.promote.layer, cm.promote.expert, perr)) {
-                        const auto pr = std::make_pair(cm.promote.layer, cm.promote.expert);
-                        if (std::find(resident_pairs.begin(), resident_pairs.end(), pr) ==
-                            resident_pairs.end()) {
-                            resident_pairs.push_back(pr);
-                        }
-                        wire::AckMsg ack{};
-                        ack.type = uint32_t(wire::AckType::PromoteAck);
-                        ack.seq = cm.seq;
-                        ack.promote_ack = {cm.promote.layer, cm.promote.expert, cm.promote.gen};
-                        (void)ipc::ring_push(*seg.ack_ring(), ack);
-                    } else {
-                        push_error_ack(seg, cm.seq, perr, /*fatal=*/false);
+                    // Non-blocking enqueue to background refill worker (Phase 3).
+                    {
+                        std::lock_guard<std::mutex> lk(refill_mu);
+                        refill_queue.push_back(PromoteTask{
+                            cm.promote.layer, cm.promote.expert, cm.promote.gen, cm.seq});
                     }
+                    refill_cv.notify_one();
                     break;
                 }
                 case wire::CtrlType::Demote: {
+                    const auto target = std::make_pair(cm.demote.layer, cm.demote.expert);
+                    // Cancel any queued promote for this exact expert; wait only if it is actively loading right now.
+                    {
+                        std::unique_lock<std::mutex> lk(refill_mu);
+                        refill_queue.erase(
+                            std::remove_if(refill_queue.begin(), refill_queue.end(),
+                                           [&](const PromoteTask& t) {
+                                               return t.layer == target.first && t.expert == target.second;
+                                           }),
+                            refill_queue.end());
+                        refill_cv.wait(lk, [&] { return !refill_busy || refill_active != target; });
+                    }
                     std::string derr;
                     if (backend.demote(cm.demote.layer, cm.demote.expert, derr)) {
-                        resident_pairs.erase(
-                            std::remove(resident_pairs.begin(), resident_pairs.end(),
-                                        std::make_pair(cm.demote.layer, cm.demote.expert)),
-                            resident_pairs.end());
+                        {
+                            std::lock_guard<std::mutex> plk(pairs_mu);
+                            resident_pairs.erase(
+                                std::remove(resident_pairs.begin(), resident_pairs.end(), target),
+                                resident_pairs.end());
+                        }
                         wire::AckMsg ack{};
                         ack.type = uint32_t(wire::AckType::DemoteAck);
                         ack.seq = cm.seq;
                         ack.demote_ack = {cm.demote.layer, cm.demote.expert, cm.demote.gen};
-                        (void)ipc::ring_push(*seg.ack_ring(), ack);
+                        push_ack_safe(ack);
                     } else {
-                        push_error_ack(seg, cm.seq, derr, /*fatal=*/false);
+                        push_error_safe(cm.seq, derr, /*fatal=*/false);
                     }
                     break;
                 }
                 case wire::CtrlType::Resync: {
-                    write_resident_bitmap(seg, g.n_expert, resident_pairs);
+                    drain_refill();
+                    uint32_t n_res = 0;
+                    {
+                        std::lock_guard<std::mutex> plk(pairs_mu);
+                        write_resident_bitmap(seg, g.n_expert, resident_pairs);
+                        n_res = uint32_t(resident_pairs.size());
+                    }
                     wire::AckMsg ack{};
                     ack.type = uint32_t(wire::AckType::OpenAck);
                     ack.seq = cm.seq;
                     ack.open_ack.gen = cm.resync.gen;
-                    ack.open_ack.n_resident = uint32_t(resident_pairs.size());
+                    ack.open_ack.n_resident = n_res;
                     ack.open_ack.bitmap_offset = seg.plan().agent_bitmap_offset;
-                    (void)ipc::ring_push(*seg.ack_ring(), ack);
+                    push_ack_safe(ack);
                     cb->agent_state.value.store(uint32_t(wire::AgentState::Ready),
                                                 std::memory_order_release);
                     break;
@@ -296,7 +394,7 @@ bool run_agent_loop(const AgentLoopConfig& cfg,
                     break;
                 }
                 default: {
-                    push_error_ack(seg, cm.seq, "unknown CtrlType", /*fatal=*/false);
+                    push_error_safe(cm.seq, "unknown CtrlType", /*fatal=*/false);
                     break;
                 }
             }
@@ -320,24 +418,26 @@ bool run_agent_loop(const AgentLoopConfig& cfg,
                 uint32_t(dh->n_tok * dh->k) > caps.max_entries_per_window ||
                 dh->layer < 0 || dh->layer >= g.n_layers) {
                 err = "invalid descriptor header on seq " + std::to_string(last_seq);
-                push_error_ack(seg, last_seq, err, /*fatal=*/true);
+                push_error_safe(last_seq, err, /*fatal=*/true);
                 ok = false;
                 running = false;
                 break;
             }
 
             const int32_t n_entries = dh->n_tok * dh->k;
+            const uint32_t dflags = dh->flags;
+            const bool compact_out = (dflags & wire::kDescFlagCompactOut) != 0;
             const int32_t* ids = wire::slot_ids(dh);
             const int32_t* kind = wire::slot_kind(dh);
-            const float* x = wire::slot_x(dh);
+            const void* x_data = static_cast<const void*>(wire::slot_x(dh));
 
             if (dh->n_agent_entries > 0) {
                 const uint64_t tc0 = ipc::now_ns();
                 std::string cerr;
-                if (!backend.compute_slot(dh->layer, dh->n_tok, dh->k, ids, kind, x,
-                                          staging_out.data(), cerr)) {
+                if (!backend.compute_slot_ex(dh->layer, dh->n_tok, dh->k, ids, kind, x_data,
+                                             dflags, staging_out.data(), cerr)) {
                     err = "compute_slot failed on layer " + std::to_string(dh->layer) + ": " + cerr;
-                    push_error_ack(seg, last_seq, err, /*fatal=*/true);
+                    push_error_safe(last_seq, err, /*fatal=*/true);
                     ok = false;
                     running = false;
                     break;
@@ -346,15 +446,22 @@ bool run_agent_loop(const AgentLoopConfig& cfg,
                 stats.compute_ms += double(tc1 - tc0) / 1e6;
                 ++stats.rounds_computed;
                 stats.entries_computed += uint64_t(dh->n_agent_entries);
+                if ((dflags & wire::kDescFlagActQ8_1) != 0) ++stats.q8_1_rounds;
+                if (compact_out) ++stats.compact_rounds;
 
                 float* row_arena = seg.row_slot(last_seq);
                 const size_t row_bytes = size_t(g.n_embd) * sizeof(float);
+                const int32_t n_agent = dh->n_agent_entries;
                 const bool committed = ipc::commit_slot_if_claimed(dh, [&] {
-                    for (int32_t e = 0; e < n_entries; ++e) {
-                        if (kind[e] != 3) continue;
-                        std::memcpy(row_arena + size_t(e) * size_t(g.n_embd),
-                                    staging_out.data() + size_t(e) * size_t(g.n_embd),
-                                    row_bytes);
+                    if (compact_out) {
+                        std::memcpy(row_arena, staging_out.data(), size_t(n_agent) * row_bytes);
+                    } else {
+                        for (int32_t e = 0; e < n_entries; ++e) {
+                            if (kind[e] != 3) continue;
+                            std::memcpy(row_arena + size_t(e) * size_t(g.n_embd),
+                                        staging_out.data() + size_t(e) * size_t(g.n_embd),
+                                        row_bytes);
+                        }
                     }
                 });
                 const uint64_t tc2 = ipc::now_ns();
@@ -368,6 +475,8 @@ bool run_agent_loop(const AgentLoopConfig& cfg,
         }
     }
 
+    stop_refill();
+    stats.async_promotes_completed = async_promotes_done.load(std::memory_order_relaxed);
     stop_heartbeat();
     cb->agent_state.value.store(uint32_t(wire::AgentState::Dead), std::memory_order_release);
     backend.shutdown();
@@ -375,11 +484,15 @@ bool run_agent_loop(const AgentLoopConfig& cfg,
     if (cfg.verbose) {
         std::fprintf(stderr,
                      "franken-agent (%s): exit (rounds_seen=%llu computed=%llu entries=%llu "
-                     "salvaged=%llu/%llu avg_compute=%.3f ms avg_commit=%.3f ms)\n",
+                     "q8_1=%llu compact=%llu async_promotes=%llu salvaged=%llu/%llu "
+                     "avg_compute=%.3f ms avg_commit=%.3f ms)\n",
                      vendor_name(caps.vendor),
                      (unsigned long long)stats.rounds_seen,
                      (unsigned long long)stats.rounds_computed,
                      (unsigned long long)stats.entries_computed,
+                     (unsigned long long)stats.q8_1_rounds,
+                     (unsigned long long)stats.compact_rounds,
+                     (unsigned long long)stats.async_promotes_completed,
                      (unsigned long long)stats.rounds_salvaged_before_claim,
                      (unsigned long long)stats.rounds_salvaged_before_commit,
                      stats.rounds_computed > 0 ? stats.compute_ms / double(stats.rounds_computed) : 0.0,

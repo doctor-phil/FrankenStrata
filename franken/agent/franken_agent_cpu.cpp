@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unistd.h>
 #include <unordered_map>
@@ -134,12 +135,16 @@ public:
         out_caps.max_entries_per_window = fw::kDefaultMaxEntries;
         out_caps.slot_count = offer_slots;
         out_caps.vendor = uint32_t(fw::AgentVendor::Cpu);
+        // CPU backend uses ggml Q8_K/Q2_0 quantizers (not q8_1), so it advertises
+        // compact row return only (naturally exercising FP32 activation fallback).
+        out_caps.feature_flags = fw::kCapCompactRows;
         return true;
     }
 
     bool open_fill(const std::vector<std::pair<int32_t, int32_t>>& pairs,
                    std::vector<std::pair<int32_t, int32_t>>& out_loaded,
                    std::string& err) override {
+        std::lock_guard<std::mutex> lk(res_mu_);
         const size_t total = size_t(g_.n_layers) * size_t(g_.n_expert);
         slot_of_.assign(total, -1);
         blobs_.clear();
@@ -157,8 +162,8 @@ public:
             const size_t idx = size_t(l) * size_t(g_.n_expert) + size_t(e);
             if (slot_of_[idx] >= 0) continue;
 
-            std::vector<uint8_t> buf;
-            if (!read_blob(l, e, buf, err)) return false;
+            auto buf = std::make_unique<std::vector<uint8_t>>();
+            if (!read_blob(l, e, *buf, err)) return false;
             const int32_t slot = int32_t(blobs_.size());
             blobs_.push_back(std::move(buf));
             slot_of_[idx] = slot;
@@ -173,11 +178,17 @@ public:
             return false;
         }
         const size_t idx = size_t(layer) * size_t(g_.n_expert) + size_t(expert);
-        if (slot_of_[idx] >= 0) return true;  // already resident
+        {
+            std::lock_guard<std::mutex> lk(res_mu_);
+            if (slot_of_[idx] >= 0) return true;  // already resident
+        }
 
-        std::vector<uint8_t> buf;
-        if (!read_blob(layer, expert, buf, err)) return false;
+        // Perform POSIX pread outside res_mu_ so compute_slot never blocks on I/O.
+        auto buf = std::make_unique<std::vector<uint8_t>>();
+        if (!read_blob(layer, expert, *buf, err)) return false;
 
+        std::lock_guard<std::mutex> lk(res_mu_);
+        if (slot_of_[idx] >= 0) return true;
         int32_t slot = -1;
         if (!free_slots_.empty()) {
             slot = free_slots_.back();
@@ -199,6 +210,7 @@ public:
             err = "CpuAgentBackend::demote: (layer, expert) out of range";
             return false;
         }
+        std::lock_guard<std::mutex> lk(res_mu_);
         const size_t idx = size_t(layer) * size_t(g_.n_expert) + size_t(expert);
         const int32_t slot = slot_of_[idx];
         if (slot < 0) return true;  // idempotent: already not resident
@@ -215,6 +227,24 @@ public:
                       const float* x,
                       float* staging_out,
                       std::string& err) override {
+        return compute_slot_ex(layer, n_tok, k, ids, kind, x, 0u, staging_out, err);
+    }
+
+    bool compute_slot_ex(int32_t layer,
+                         int32_t n_tok,
+                         int32_t k,
+                         const int32_t* ids,
+                         const int32_t* kind,
+                         const void* x_data,
+                         uint32_t desc_flags,
+                         float* staging_out,
+                         std::string& err) override {
+        if ((desc_flags & fw::kDescFlagActQ8_1) != 0) {
+            err = "CpuAgentBackend: q8_1 activations not supported";
+            return false;
+        }
+        const bool compact_out = (desc_flags & fw::kDescFlagCompactOut) != 0;
+        const float* x = static_cast<const float*>(x_data);
         const cpu::ExpertLayout& lay = cpu::expert_layout();
         const bool native = lay.native;
         const int64_t n = int64_t(n_tok) * int64_t(k);
@@ -235,47 +265,58 @@ public:
             }
         }
 
+        // Precompute router-order compact index for every kind == 3 entry.
+        int32_t compact_of[fw::kDefaultMaxEntries];
+        int32_t cidx = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            compact_of[i] = (kind[i] == 3) ? cidx++ : -1;
+        }
+
         jobs_.clear();
         distinct_.clear();
-        for (int64_t i = 0; i < n; ++i) {
-            if (kind[i] != 3) continue;
-            const int32_t e = ids[i];
-            if (e < 0 || e >= g_.n_expert) {
-                err = "CpuAgentBackend: expert id out of range";
-                return false;
-            }
-            bool seen = false;
-            for (int32_t prev : distinct_) {
-                if (prev == e) { seen = true; break; }
-            }
-            if (seen) continue;
-            distinct_.push_back(e);
-
-            const int32_t slot = slot_of_[size_t(layer) * size_t(g_.n_expert) + size_t(e)];
-            if (slot < 0) {
-                err = "CpuAgentBackend: requested (layer=" + std::to_string(layer) +
-                      ", expert=" + std::to_string(e) + ") is not resident";
-                return false;
-            }
-            const uint8_t* blob_ptr = blobs_[size_t(slot)].data();
-            cpu::ExpertJobMulti cur{};
-            cur.blob = blob_ptr;
-            cur.nt = 0;
-            for (int64_t j = i; j < n; ++j) {
-                if (kind[j] != 3 || ids[j] != e) continue;
-                if (cur.nt == cpu::MAXT) {
-                    jobs_.push_back(cur);
-                    cur = cpu::ExpertJobMulti{};
-                    cur.blob = blob_ptr;
-                    cur.nt = 0;
+        {
+            std::lock_guard<std::mutex> lk(res_mu_);
+            for (int64_t i = 0; i < n; ++i) {
+                if (kind[i] != 3) continue;
+                const int32_t e = ids[i];
+                if (e < 0 || e >= g_.n_expert) {
+                    err = "CpuAgentBackend: expert id out of range";
+                    return false;
                 }
-                const int32_t tok = int32_t(j / k);
-                cur.act[cur.nt] = &act_multi_[size_t(tok)];
-                cur.nact[cur.nt] = native ? nact_multi_.data() + size_t(tok) * cpu::kNativeActBytes : nullptr;
-                cur.out[cur.nt] = staging_out + size_t(j) * size_t(g_.n_embd);
-                ++cur.nt;
+                bool seen = false;
+                for (int32_t prev : distinct_) {
+                    if (prev == e) { seen = true; break; }
+                }
+                if (seen) continue;
+                distinct_.push_back(e);
+
+                const int32_t slot = slot_of_[size_t(layer) * size_t(g_.n_expert) + size_t(e)];
+                if (slot < 0) {
+                    err = "CpuAgentBackend: requested (layer=" + std::to_string(layer) +
+                          ", expert=" + std::to_string(e) + ") is not resident";
+                    return false;
+                }
+                const uint8_t* blob_ptr = blobs_[size_t(slot)]->data();
+                cpu::ExpertJobMulti cur{};
+                cur.blob = blob_ptr;
+                cur.nt = 0;
+                for (int64_t j = i; j < n; ++j) {
+                    if (kind[j] != 3 || ids[j] != e) continue;
+                    if (cur.nt == cpu::MAXT) {
+                        jobs_.push_back(cur);
+                        cur = cpu::ExpertJobMulti{};
+                        cur.blob = blob_ptr;
+                        cur.nt = 0;
+                    }
+                    const int32_t tok = int32_t(j / k);
+                    const int32_t dst_row = compact_out ? compact_of[j] : int32_t(j);
+                    cur.act[cur.nt] = &act_multi_[size_t(tok)];
+                    cur.nact[cur.nt] = native ? nact_multi_.data() + size_t(tok) * cpu::kNativeActBytes : nullptr;
+                    cur.out[cur.nt] = staging_out + size_t(dst_row) * size_t(g_.n_embd);
+                    ++cur.nt;
+                }
+                if (cur.nt > 0) jobs_.push_back(cur);
             }
-            if (cur.nt > 0) jobs_.push_back(cur);
         }
 
         for (size_t off = 0; off < jobs_.size(); off += size_t(cpu::ExpertPool::kMaxSplitMulti)) {
@@ -335,9 +376,10 @@ private:
     std::unordered_map<std::string, int> shard_fds_;
     std::vector<int> role_fd_;
     std::unique_ptr<cpu::ExpertPool> pool_;
+    std::mutex res_mu_;
     std::vector<int32_t> slot_of_;
     std::vector<int32_t> free_slots_;
-    std::vector<std::vector<uint8_t>> blobs_;
+    std::vector<std::unique_ptr<std::vector<uint8_t>>> blobs_;
     std::vector<cpu::ActQ> act_multi_;
     std::vector<uint8_t> nact_multi_;
     std::vector<cpu::ExpertJobMulti> jobs_;

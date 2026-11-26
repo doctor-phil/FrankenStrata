@@ -175,13 +175,20 @@ struct Geometry {
 // HELLO)"; §4.3 step 2: the agent "answers with its caps and slot count").
 // Written by the agent into the control block as part of HELLO, before
 // agent_state leaves Absent. The session runs at min(geometry offer, caps).
+//
+// Phase 3 capability bits (backward-compatible: v1 peers leave feature_flags = 0
+// and receive FP32 activations + sparse router-order row arena).
 // ---------------------------------------------------------------------------
+
+inline constexpr uint32_t kCapQ8_1Activations = 1u << 0;  // accepts pre-quantized q8_1 in x arena
+inline constexpr uint32_t kCapCompactRows     = 1u << 1;  // packs kind==3 rows contiguously [0..n_agent_entries)
 
 struct Caps {
     uint32_t max_tokens_per_window;
     uint32_t max_entries_per_window;
-    uint32_t slot_count;  // ExpertCache slots the agent allocated (§4.3 step 2)
-    uint32_t vendor;      // AgentVendor (informational only, §5.4)
+    uint32_t slot_count;     // ExpertCache slots the agent allocated (§4.3 step 2)
+    uint32_t vendor;         // AgentVendor (informational only, §5.4)
+    uint32_t feature_flags;  // bitmask of kCap* (0 for v1 peers)
 };
 
 // ---------------------------------------------------------------------------
@@ -234,6 +241,13 @@ struct ControlBlock {
 //   x arena fp32[n_tok * H]  — this round's activations (Phase 1 format)
 // ---------------------------------------------------------------------------
 
+// Descriptor flags (stored in DescriptorHeader::flags; 0 = Phase 1 defaults).
+inline constexpr uint32_t kDescFlagActQ8_1    = 1u << 0;  // x arena holds n_tok*(H/32)*36 B block_q8_1
+inline constexpr uint32_t kDescFlagCompactOut = 1u << 1;  // row arena holds n_agent_entries contiguous rows
+
+inline constexpr size_t kQ8_1BlockElems = 32;
+inline constexpr size_t kQ8_1BlockBytes = 36;  // half d (2) + half s (2) + int8 qs[32]
+
 struct DescriptorHeader {
     // The state word is the slot's first field so its address is stable and
     // known to both sides: it is the futex word (§4.4.1) and the salvage
@@ -253,7 +267,7 @@ struct DescriptorHeader {
     uint32_t ids_offset;
     uint32_t kind_offset;
     uint32_t x_offset;
-    uint32_t reserved0;
+    uint32_t flags;               // bitmask of kDescFlag* (was reserved0; 0 for v1)
 };
 
 // Row arena (DESIGN §4.2): R slots of fp32[max_entries * H]. This region IS

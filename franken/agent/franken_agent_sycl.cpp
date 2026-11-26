@@ -12,6 +12,7 @@
 
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/copy_queue.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/gguf_expert_source.hpp"
@@ -29,6 +30,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -39,6 +41,38 @@ namespace fw = franken::wire;
 namespace fi = franken::ipc;
 namespace fa = franken::agent;
 namespace cpu = strata::kernels::cpu;
+
+// Coherency self-test for host-pinned USM staging (analogous to p2p_copies_data
+// in src/core/peer_experts.cpp): round-trips a pseudo-random pattern H2D -> D2H
+// through USM host memory and verifies bit-exact equality before relying on it.
+bool verify_usm_staging_coherency(sycl::queue* q) {
+    constexpr size_t kN = 16384;  // 64 KiB
+    float* h = nullptr;
+    float* d = nullptr;
+    bool ok = false;
+    try {
+        h = sycl::malloc_host<float>(kN, *q);
+        d = sycl::malloc_device<float>(kN, *q);
+        if (h != nullptr && d != nullptr) {
+            std::vector<float> ref(kN);
+            for (size_t i = 0; i < kN; ++i) {
+                ref[i] = 1.0f + float((i * 2654435761u) % 4093u);
+                h[i] = ref[i];
+            }
+            q->memcpy(d, h, kN * sizeof(float));
+            q->wait_and_throw();
+            std::memset(h, 0, kN * sizeof(float));
+            q->memcpy(h, d, kN * sizeof(float));
+            q->wait_and_throw();
+            ok = (std::memcmp(h, ref.data(), kN * sizeof(float)) == 0);
+        }
+    } catch (...) {
+        ok = false;
+    }
+    if (d != nullptr) sycl::free(d, *q);
+    if (h != nullptr) sycl::free(h, *q);
+    return ok;
+}
 
 // Single contiguous metadata upload per round (mirrors PeerExperts::Meta).
 struct SyclMeta {
@@ -108,6 +142,20 @@ public:
         q_ = &dpct::get_in_order_queue();
         const std::string dev_name = q_->get_device().get_info<sycl::info::device::name>();
 
+        // Verify USM host-pinned staging coherency before enabling it.
+        usm_staging_ok_ = verify_usm_staging_coherency(q_);
+        std::fprintf(stderr, "franken-agent-sycl: USM host staging coherency self-test: %s\n",
+                     usm_staging_ok_ ? "PASS" : "FAIL (falling back to pageable staging)");
+
+        // Dedicated background copy queue for non-blocking async PROMOTE refills.
+        refill_q_ = strata::make_copy_engine_queue("franken-promote");
+        if (refill_q_ == nullptr) {
+            refill_q_ = dpct::get_current_device().create_queue(true);
+            owns_refill_q_ = true;
+        }
+        std::fprintf(stderr, "franken-agent-sycl: async PROMOTE refill queue: %s\n",
+                     owns_refill_q_ ? "dedicated compute-engine queue" : "Level Zero copy engine");
+
         // Allocate compute workspace BEFORE measuring remaining VRAM for expert slots.
         cap_tok_ = std::min<uint32_t>(g.max_tokens, fw::kDefaultMaxTokens);
         cap_ent_ = std::min<uint32_t>(g.max_entries, fw::kDefaultMaxEntries);
@@ -123,9 +171,23 @@ public:
             size_t(cap_tok_) * size_t(g.n_embd / 32) * 34);
 
         try {
-            h_x_ = sycl::malloc_host<float>(size_t(cap_tok_) * size_t(g.n_embd), *q_);
-            h_out_ = sycl::malloc_host<float>(size_t(cap_ent_) * size_t(g.n_embd), *q_);
-            h_meta_ = sycl::malloc_host<SyclMeta>(1, *q_);
+            if (usm_staging_ok_) {
+                h_x_ = sycl::malloc_host<float>(size_t(cap_tok_) * size_t(g.n_embd), *q_);
+                h_q8_ = sycl::malloc_host<uint8_t>(q8_bytes, *q_);
+                h_out_ = sycl::malloc_host<float>(size_t(cap_ent_) * size_t(g.n_embd), *q_);
+                h_meta_ = sycl::malloc_host<SyclMeta>(1, *q_);
+                refill_bounce_usm_ = sycl::malloc_host<uint8_t>(size_t(lay.max_blob), *q_);
+            } else {
+                h_x_vec_.resize(size_t(cap_tok_) * size_t(g.n_embd));
+                h_q8_vec_.resize(q8_bytes);
+                h_out_vec_.resize(size_t(cap_ent_) * size_t(g.n_embd));
+                h_meta_vec_.resize(1);
+                h_x_ = h_x_vec_.data();
+                h_q8_ = h_q8_vec_.data();
+                h_out_ = h_out_vec_.data();
+                h_meta_ = h_meta_vec_.data();
+            }
+            if (refill_bounce_usm_ == nullptr) refill_bounce_vec_.resize(size_t(lay.max_blob));
             d_x_ = sycl::malloc_device<float>(size_t(cap_tok_) * size_t(g.n_embd), *q_);
             d_out_ = sycl::malloc_device<float>(size_t(cap_ent_) * size_t(g.n_embd), *q_);
             d_meta_ = sycl::malloc_device<SyclMeta>(1, *q_);
@@ -137,7 +199,7 @@ public:
             shutdown();
             return false;
         }
-        if (!h_x_ || !h_out_ || !h_meta_ || !d_x_ || !d_out_ ||
+        if (!h_x_ || !h_q8_ || !h_out_ || !h_meta_ || !d_x_ || !d_out_ ||
             !d_meta_ || !d_q8_ || !d_scales_ || !d_scratch_) {
             err = "SyclAgentBackend: SYCL malloc returned nullptr";
             shutdown();
@@ -175,6 +237,7 @@ public:
         out_caps.max_entries_per_window = cap_ent_;
         out_caps.slot_count = est_slots;
         out_caps.vendor = uint32_t(fw::AgentVendor::Sycl);
+        out_caps.feature_flags = fw::kCapQ8_1Activations | fw::kCapCompactRows;
         return true;
     }
 
@@ -253,39 +316,63 @@ public:
             return false;
         }
         const size_t idx = size_t(layer) * size_t(g_.n_expert) + size_t(expert);
-        if (res_[idx] >= 0) return true;  // already resident
-
         const cpu::ExpertLayout& lay = cpu::expert_layout();
         const uint64_t need = lay.blob_bytes(layer);
 
-        // Best-fit search over freed slots enforcing slot_room(s) >= blob_bytes(layer).
-        size_t best_pos = free_slots_.size();
-        uint64_t best_room = ~0ull;
-        for (size_t i = 0; i < free_slots_.size(); ++i) {
-            const int32_t s = free_slots_[i];
-            const uint64_t room = cache_.slot_room(s);
-            if (room >= need && room < best_room) {
-                best_room = room;
-                best_pos = i;
+        // 1. Claim a freed slot with room >= need under res_mu_, then release lock
+        //    before performing blob I/O and H2D copy on refill_q_.
+        int32_t slot = -1;
+        {
+            std::lock_guard<std::mutex> lk(res_mu_);
+            if (res_[idx] >= 0) return true;  // already resident
+            size_t best_pos = free_slots_.size();
+            uint64_t best_room = ~0ull;
+            for (size_t i = 0; i < free_slots_.size(); ++i) {
+                const int32_t s = free_slots_[i];
+                const uint64_t room = cache_.slot_room(s);
+                if (room >= need && room < best_room) {
+                    best_room = room;
+                    best_pos = i;
+                }
             }
+            if (best_pos == free_slots_.size()) {
+                err = "SyclAgentBackend::promote: no freed slot with room >= " +
+                      std::to_string(need) + " B for layer " + std::to_string(layer);
+                return false;
+            }
+            slot = free_slots_[best_pos];
+            free_slots_.erase(free_slots_.begin() + ptrdiff_t(best_pos));
         }
-        if (best_pos == free_slots_.size()) {
-            err = "SyclAgentBackend::promote: no freed slot with room >= " +
-                  std::to_string(need) + " B for layer " + std::to_string(layer);
+
+        // 2. Thread-safe blob read into dedicated refill bounce buffer + H2D on refill_q_.
+        uint8_t* bounce = refill_bounce_usm_ != nullptr ? refill_bounce_usm_ : refill_bounce_vec_.data();
+        bool read_ok = false;
+        if (gguf_src_) {
+            read_ok = gguf_src_->read_into(layer, expert, bounce, size_t(need));
+        } else if (src_) {
+            read_ok = src_->copy_blob(layer, expert, bounce);
+        }
+        if (!read_ok) {
+            std::lock_guard<std::mutex> lk(res_mu_);
+            free_slots_.push_back(slot);
+            err = "SyclAgentBackend::promote: thread-safe blob read failed";
             return false;
         }
 
-        const int32_t slot = free_slots_[best_pos];
-        const uint8_t* b = src_->blob(layer, expert);
-        if (b == nullptr) {
-            err = "SyclAgentBackend::promote: source blob returned nullptr";
+        try {
+            refill_q_->memcpy(cache_.device_slot(slot), bounce, size_t(need)).wait_and_throw();
+        } catch (const std::exception& ex) {
+            std::lock_guard<std::mutex> lk(res_mu_);
+            free_slots_.push_back(slot);
+            err = std::string("SyclAgentBackend::promote: H2D copy failed: ") + ex.what();
             return false;
         }
-        if (!cache_.fill_slot_blocking(slot, b, err, int64_t(need))) {
-            return false;
+
+        // 3. Publish slot in residency table only AFTER copy has completed.
+        {
+            std::lock_guard<std::mutex> lk(res_mu_);
+            res_[idx] = slot;
         }
-        free_slots_.erase(free_slots_.begin() + ptrdiff_t(best_pos));
-        res_[idx] = slot;
         return true;
     }
 
@@ -294,6 +381,7 @@ public:
             err = "SyclAgentBackend::demote: (layer, expert) out of range";
             return false;
         }
+        std::lock_guard<std::mutex> lk(res_mu_);
         const size_t idx = size_t(layer) * size_t(g_.n_expert) + size_t(expert);
         const int32_t slot = res_[idx];
         if (slot < 0) return true;  // idempotent
@@ -310,44 +398,71 @@ public:
                       const float* x,
                       float* staging_out,
                       std::string& err) override {
+        return compute_slot_ex(layer, n_tok, k, ids, kind, x, 0u, staging_out, err);
+    }
+
+    bool compute_slot_ex(int32_t layer,
+                         int32_t n_tok,
+                         int32_t k,
+                         const int32_t* ids,
+                         const int32_t* kind,
+                         const void* x_data,
+                         uint32_t desc_flags,
+                         float* staging_out,
+                         std::string& err) override {
         const int64_t n = int64_t(n_tok) * int64_t(k);
         if (n_tok > int32_t(cap_tok_) || n > int64_t(cap_ent_)) {
             err = "SyclAgentBackend: window exceeds agent caps";
             return false;
         }
 
+        const bool act_q8_1 = (desc_flags & fw::kDescFlagActQ8_1) != 0;
+        const bool compact_out = (desc_flags & fw::kDescFlagCompactOut) != 0;
+
+        // Map each kind == 3 entry to its router-order compact output index [0..n_agent_entries).
+        int32_t compact_of[fw::kDefaultMaxEntries];
+        int32_t n_compact = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            compact_of[i] = (kind[i] == 3) ? n_compact++ : -1;
+        }
+
         SyclMeta& m = *h_meta_;
         row_to_entry_.clear();
         int32_t groups = 0, rows = 0;
 
-        for (int64_t i = 0; i < n; ++i) {
-            if (kind[i] != 3) continue;
-            const int32_t e = ids[i];
-            bool seen = false;
-            for (int64_t j = 0; j < i; ++j) {
-                if (kind[j] == 3 && ids[j] == e) { seen = true; break; }
-            }
-            if (seen) continue;
-            const int32_t slot =
-                (e >= 0 && e < g_.n_expert)
-                    ? res_[size_t(layer) * size_t(g_.n_expert) + size_t(e)]
-                    : strata::core::kNotResident;
-            if (slot < 0) {
-                err = "SyclAgentBackend: routed kind==3 expert (" + std::to_string(layer) +
-                      "," + std::to_string(e) + ") not resident";
-                return false;
-            }
-            m.ptr[groups] = reinterpret_cast<unsigned long long>(cache_.device_slot(slot));
-            m.start[groups] = rows;
-            for (int64_t j = i; j < n; ++j) {
-                if (kind[j] == 3 && ids[j] == e) {
-                    m.dst[rows] = rows;
-                    m.tok[rows] = int32_t(j / k);
-                    row_to_entry_.push_back(int32_t(j));
-                    ++rows;
+        {
+            std::lock_guard<std::mutex> lk(res_mu_);
+            for (int64_t i = 0; i < n; ++i) {
+                if (kind[i] != 3) continue;
+                const int32_t e = ids[i];
+                bool seen = false;
+                for (int64_t j = 0; j < i; ++j) {
+                    if (kind[j] == 3 && ids[j] == e) { seen = true; break; }
                 }
+                if (seen) continue;
+                const int32_t slot =
+                    (e >= 0 && e < g_.n_expert)
+                        ? res_[size_t(layer) * size_t(g_.n_expert) + size_t(e)]
+                        : strata::core::kNotResident;
+                if (slot < 0) {
+                    err = "SyclAgentBackend: routed kind==3 expert (" + std::to_string(layer) +
+                          "," + std::to_string(e) + ") not resident";
+                    return false;
+                }
+                m.ptr[groups] = reinterpret_cast<unsigned long long>(cache_.device_slot(slot));
+                m.start[groups] = rows;
+                for (int64_t j = i; j < n; ++j) {
+                    if (kind[j] == 3 && ids[j] == e) {
+                        // With compact_out, the kernel writes directly into router-order
+                        // compact row `compact_of[j]`, eliminating host-side scatter!
+                        m.dst[rows] = compact_out ? compact_of[j] : rows;
+                        m.tok[rows] = int32_t(j / k);
+                        if (!compact_out) row_to_entry_.push_back(int32_t(j));
+                        ++rows;
+                    }
+                }
+                ++groups;
             }
-            ++groups;
         }
         if (groups == 0) return true;
 
@@ -357,20 +472,32 @@ public:
         m.count[2] = 0;
         m.count[3] = 0;
 
-        std::memcpy(h_x_, x, size_t(n_tok) * size_t(g_.n_embd) * sizeof(float));
+        const cpu::ExpertLayout& lay = cpu::expert_layout();
+        const size_t q8_1_bytes = size_t(n_tok) * size_t(g_.n_embd / 32) * fw::kQ8_1BlockBytes;
+        const size_t fp32_bytes = size_t(n_tok) * size_t(g_.n_embd) * sizeof(float);
+
+        if (act_q8_1 && lay.native) {
+            std::memcpy(h_q8_, x_data, q8_1_bytes);
+        } else {
+            std::memcpy(h_x_, x_data, fp32_bytes);
+        }
 
         try {
-            q_->memcpy(d_x_, h_x_, size_t(n_tok) * size_t(g_.n_embd) * sizeof(float));
             q_->memcpy(d_meta_, h_meta_, sizeof(SyclMeta));
 
-            const cpu::ExpertLayout& lay = cpu::expert_layout();
             if (lay.native) {
                 const cpu::NativeFmt& f = lay.fmt[size_t(layer)];
-                if (f.had_gu) {
-                    strata::kernels::hadamard_rows(d_x_, d_x_, n_tok, g_.n_embd,
-                                                   f.had_block, d_sx_, q_);
+                if (act_q8_1 && !f.had_gu) {
+                    // Phase 3 fast path: upload pre-quantized q8_1 directly, skip quantize_q8_1_rows!
+                    q_->memcpy(d_q8_, h_q8_, q8_1_bytes);
+                } else {
+                    q_->memcpy(d_x_, h_x_, fp32_bytes);
+                    if (f.had_gu) {
+                        strata::kernels::hadamard_rows(d_x_, d_x_, n_tok, g_.n_embd,
+                                                       f.had_block, d_sx_, q_);
+                    }
+                    strata::kernels::quantize_q8_1_rows(d_x_, n_tok, g_.n_embd, d_q8_, q_);
                 }
-                strata::kernels::quantize_q8_1_rows(d_x_, n_tok, g_.n_embd, d_q8_, q_);
                 auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
                 if (f.had_d) {
                     L.had_block = f.had_block;
@@ -381,6 +508,7 @@ public:
                     d_meta_->dst, d_meta_->tok, groups, rows,
                     d_q8_, d_scratch_, d_out_, q_);
             } else {
+                q_->memcpy(d_x_, h_x_, fp32_bytes);
                 strata::kernels::quantize_q8_0_scaled(d_x_, d_q8_, d_scales_,
                                                       int64_t(n_tok) * int64_t(g_.n_embd), q_);
                 strata::kernels::moe_grouped_s2(
@@ -398,23 +526,44 @@ public:
         }
 
         const size_t row_bytes = size_t(g_.n_embd) * sizeof(float);
-        for (int32_t r = 0; r < rows; ++r) {
-            std::memcpy(staging_out + size_t(row_to_entry_[size_t(r)]) * size_t(g_.n_embd),
-                        h_out_ + size_t(r) * size_t(g_.n_embd),
-                        row_bytes);
+        if (compact_out) {
+            std::memcpy(staging_out, h_out_, size_t(rows) * row_bytes);
+        } else {
+            for (int32_t r = 0; r < rows; ++r) {
+                std::memcpy(staging_out + size_t(row_to_entry_[size_t(r)]) * size_t(g_.n_embd),
+                            h_out_ + size_t(r) * size_t(g_.n_embd),
+                            row_bytes);
+            }
         }
         return true;
     }
 
     void shutdown() override {
+        if (refill_q_ != nullptr) {
+            try { refill_q_->wait_and_throw(); } catch (...) {}
+            if (owns_refill_q_) {
+                dpct::get_current_device().destroy_queue(refill_q_);
+                owns_refill_q_ = false;
+            }
+            refill_q_ = nullptr;
+        }
         if (q_ != nullptr) {
             try { q_->wait_and_throw(); } catch (...) {}
             auto free_ptr = [&](auto*& p) {
                 if (p != nullptr) { sycl::free(p, *q_); p = nullptr; }
             };
-            free_ptr(h_x_);
-            free_ptr(h_out_);
-            free_ptr(h_meta_);
+            if (usm_staging_ok_) {
+                free_ptr(h_x_);
+                free_ptr(h_q8_);
+                free_ptr(h_out_);
+                free_ptr(h_meta_);
+                free_ptr(refill_bounce_usm_);
+            } else {
+                h_x_ = nullptr;
+                h_q8_ = nullptr;
+                h_out_ = nullptr;
+                h_meta_ = nullptr;
+            }
             free_ptr(d_x_);
             free_ptr(d_out_);
             free_ptr(d_meta_);
@@ -422,6 +571,11 @@ public:
             free_ptr(d_scales_);
             free_ptr(d_scratch_);
         }
+        h_x_vec_.clear();
+        h_q8_vec_.clear();
+        h_out_vec_.clear();
+        h_meta_vec_.clear();
+        refill_bounce_vec_.clear();
         cache_.close();
         res_.clear();
         free_slots_.clear();
@@ -441,19 +595,30 @@ private:
     fw::Geometry g_{};
     uint32_t cap_tok_ = 0, cap_ent_ = 0;
     uint64_t vram_budget_ = 0;
+    bool usm_staging_ok_ = false;
 
     std::unique_ptr<strata::core::GgufExpertSource> gguf_src_;
     std::unique_ptr<strata::core::FileExpertSource> file_src_;
     strata::core::ExpertSource* src_ = nullptr;
 
     sycl::queue* q_ = nullptr;
+    sycl::queue* refill_q_ = nullptr;
+    bool owns_refill_q_ = false;
     strata::core::ExpertCache cache_;
+    std::mutex res_mu_;
     std::vector<int32_t> res_;
     std::vector<int32_t> free_slots_;
 
     float* h_x_ = nullptr;
+    uint8_t* h_q8_ = nullptr;
     float* h_out_ = nullptr;
     SyclMeta* h_meta_ = nullptr;
+    uint8_t* refill_bounce_usm_ = nullptr;
+    std::vector<float> h_x_vec_;
+    std::vector<uint8_t> h_q8_vec_;
+    std::vector<float> h_out_vec_;
+    std::vector<SyclMeta> h_meta_vec_;
+    std::vector<uint8_t> refill_bounce_vec_;
     float* d_x_ = nullptr;
     float* d_out_ = nullptr;
     SyclMeta* d_meta_ = nullptr;

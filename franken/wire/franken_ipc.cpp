@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <ctime>
 #include <thread>
@@ -461,6 +462,137 @@ bool pack_identity_matches(const wire::PackIdentity& a, const wire::PackIdentity
     return a.format == b.format &&
            a.experts_bin_size == b.experts_bin_size &&
            a.gguf_shard_list_hash == b.gguf_shard_list_hash;
+}
+
+namespace {
+
+// Exact round-to-nearest-even f32 -> fp16 bits (mirrors include/strata/kernels/f16_bits.hpp).
+inline uint16_t f16_bits_rne(float f) {
+    uint32_t x = 0;
+    std::memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const uint32_t rawexp = (x >> 23) & 0xFFu;
+    const int exp = int(rawexp) - 127 + 15;
+    uint32_t man = x & 0x7FFFFFu;
+    if (rawexp == 0xFFu) return uint16_t(sign | 0x7C00u | (man ? 0x200u : 0u));
+    if (exp >= 31) return uint16_t(sign | 0x7C00u);
+    if (exp <= 0) {
+        if (exp < -10) return uint16_t(sign);
+        man |= 0x800000u;
+        const uint32_t sh = uint32_t(14 - exp);
+        uint32_t h = (man >> sh) & 0x3FFu;
+        const uint32_t rem = man & ((1u << sh) - 1u);
+        if (rem > (1u << (sh - 1)) || (rem == (1u << (sh - 1)) && (h & 1u))) ++h;
+        return uint16_t(sign | h);
+    }
+    uint16_t h = uint16_t(sign | (uint32_t(exp) << 10) | (man >> 13));
+    const uint32_t rem = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) ++h;
+    return h;
+}
+
+inline float clamp_half_finite(float v) {
+    constexpr float kHalfMax = 65504.0f;
+    return std::fabs(v) > kHalfMax ? std::copysign(kHalfMax, v) : v;
+}
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx2,f16c")))
+void quantize_q8_1_rows_avx2(const float* x, int32_t n_blocks, uint8_t* dst) {
+    const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+    const __m256 v_min = _mm256_set1_ps(-127.0f);
+    const __m256 v_max = _mm256_set1_ps(127.0f);
+
+    for (int32_t b = 0; b < n_blocks; ++b) {
+        const float* src = x + size_t(b) * 32;
+        const __m256 v0 = _mm256_loadu_ps(src);
+        const __m256 v1 = _mm256_loadu_ps(src + 8);
+        const __m256 v2 = _mm256_loadu_ps(src + 16);
+        const __m256 v3 = _mm256_loadu_ps(src + 24);
+
+        __m256 am = _mm256_max_ps(
+            _mm256_max_ps(_mm256_andnot_ps(sign_mask, v0), _mm256_andnot_ps(sign_mask, v1)),
+            _mm256_max_ps(_mm256_andnot_ps(sign_mask, v2), _mm256_andnot_ps(sign_mask, v3)));
+        __m128 am_lo = _mm_max_ps(_mm256_castps256_ps128(am), _mm256_extractf128_ps(am, 1));
+        am_lo = _mm_max_ps(am_lo, _mm_movehl_ps(am_lo, am_lo));
+        am_lo = _mm_max_ss(am_lo, _mm_shuffle_ps(am_lo, am_lo, 1));
+        const float amax = _mm_cvtss_f32(am_lo);
+
+        __m256 sm = _mm256_add_ps(_mm256_add_ps(v0, v1), _mm256_add_ps(v2, v3));
+        __m128 sm_lo = _mm_add_ps(_mm256_castps256_ps128(sm), _mm256_extractf128_ps(sm, 1));
+        sm_lo = _mm_add_ps(sm_lo, _mm_movehl_ps(sm_lo, sm_lo));
+        sm_lo = _mm_add_ss(sm_lo, _mm_shuffle_ps(sm_lo, sm_lo, 1));
+        const float sum = _mm_cvtss_f32(sm_lo);
+
+        const float d = clamp_half_finite(amax / 127.0f);
+        const float sf = clamp_half_finite(sum);
+        const __m128 ds_f32 = _mm_set_ps(0.0f, 0.0f, sf, d);
+        const __m128i ds_f16 = _mm_cvtps_ph(ds_f32, _MM_FROUND_TO_NEAREST_INT);
+        const uint32_t ds_bits = uint32_t(_mm_cvtsi128_si32(ds_f16));
+
+        uint8_t* out = dst + size_t(b) * wire::kQ8_1BlockBytes;
+        std::memcpy(out, &ds_bits, 4);
+
+        if (amax == 0.0f) {
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + 4), _mm256_setzero_si256());
+            continue;
+        }
+        const __m256 inv_d = _mm256_set1_ps(1.0f / d);
+        const __m256i q0 = _mm256_cvtps_epi32(_mm256_min_ps(v_max, _mm256_max_ps(v_min, _mm256_mul_ps(v0, inv_d))));
+        const __m256i q1 = _mm256_cvtps_epi32(_mm256_min_ps(v_max, _mm256_max_ps(v_min, _mm256_mul_ps(v1, inv_d))));
+        const __m256i q2 = _mm256_cvtps_epi32(_mm256_min_ps(v_max, _mm256_max_ps(v_min, _mm256_mul_ps(v2, inv_d))));
+        const __m256i q3 = _mm256_cvtps_epi32(_mm256_min_ps(v_max, _mm256_max_ps(v_min, _mm256_mul_ps(v3, inv_d))));
+
+        // Pack 4 x 8 int32 -> 2 x 16 int16 -> 32 int8 preserving exact lane order.
+        const __m256i p01 = _mm256_permute4x64_epi64(_mm256_packs_epi32(q0, q1), 0xD8);
+        const __m256i p23 = _mm256_permute4x64_epi64(_mm256_packs_epi32(q2, q3), 0xD8);
+        const __m256i packed = _mm256_permute4x64_epi64(_mm256_packs_epi16(p01, p23), 0xD8);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + 4), packed);
+    }
+}
+#endif
+
+}  // namespace
+
+void quantize_q8_1_rows_host(const float* x, int32_t n_rows, int32_t n_cols, uint8_t* dst) {
+    if (n_rows <= 0 || n_cols <= 0 || (n_cols & 31) != 0) return;
+    const int32_t n_blocks = (n_rows * n_cols) / 32;
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    static const bool has_avx2_f16c = [] {
+        __builtin_cpu_init();
+        return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("f16c");
+    }();
+    if (has_avx2_f16c) {
+        quantize_q8_1_rows_avx2(x, n_blocks, dst);
+        return;
+    }
+#endif
+    for (int32_t b = 0; b < n_blocks; ++b) {
+        const float* src = x + size_t(b) * 32;
+        float amax = 0.0f;
+        float sum = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            const float xi = src[i];
+            const float ax = std::fabs(xi);
+            if (ax > amax) amax = ax;
+            sum += xi;
+        }
+        const float d = clamp_half_finite(amax / 127.0f);
+        const uint16_t d16 = f16_bits_rne(d);
+        const uint16_t s16 = f16_bits_rne(clamp_half_finite(sum));
+        uint8_t* out = dst + size_t(b) * wire::kQ8_1BlockBytes;
+        std::memcpy(out, &d16, 2);
+        std::memcpy(out + 2, &s16, 2);
+        auto* qs = reinterpret_cast<int8_t*>(out + 4);
+        if (amax == 0.0f) {
+            std::memset(qs, 0, 32);
+        } else {
+            for (int i = 0; i < 32; ++i) {
+                const float q = std::roundf(src[i] / d);
+                qs[i] = int8_t(q > 127.0f ? 127.0f : (q < -127.0f ? -127.0f : q));
+            }
+        }
+    }
 }
 
 }  // namespace ipc

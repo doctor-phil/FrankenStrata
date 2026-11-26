@@ -72,15 +72,16 @@ public:
     }
 
     // Publishes a round descriptor for entries with `kind[i] == 3` and rings the
-    // agent doorbell. Returns true if launched, false if there were no kind == 3
-    // entries OR if the agent was just detected Dead (caller inspects `launched()`
-    // / `alive()` to decide whether entries must fall back to CPU immediately).
+    // agent doorbell. If `allow_q8_1` is true and the agent negotiated
+    // kCapQ8_1Activations, pre-quantizes x to q8_1 on the host (~3.5x smaller wire
+    // payload, skips agent-side quantization).
     bool launch(int64_t layer,
                 const float* x,
                 const int32_t* ids,
                 int64_t n_tok,
                 int64_t k,
-                const int32_t* kind);
+                const int32_t* kind,
+                bool allow_q8_1 = false);
 
     bool launched() const { return launched_; }
 
@@ -110,6 +111,9 @@ public:
     const char* vendor_str() const;
     uint32_t advertised_slots() const { return caps_.slot_count; }
     uint32_t allocated_slots() const { return allocated_slots_; }
+    uint32_t feature_flags() const { return caps_.feature_flags; }
+    bool uses_q8_1() const { return use_q8_1_; }
+    bool uses_compact_rows() const { return use_compact_rows_; }
     uint32_t residency_gen() const { return residency_gen_; }
     bool needs_resync() const { return needs_resync_; }
     int64_t n_layers() const { return n_layers_; }
@@ -126,8 +130,13 @@ public:
     uint64_t promotes_acked() const { return promotes_acked_; }
     uint64_t demotes_sent() const { return demotes_sent_; }
     uint64_t resyncs_done() const { return resyncs_done_; }
+    double c_move_ms() const { return c_move_ms_; }
+    uint64_t move_samples() const { return move_samples_; }
     double last_round_ms() const { return last_round_ms_; }
     int32_t last_round_entries() const { return last_round_entries_; }
+    int32_t last_round_distinct() const { return last_round_distinct_; }
+    double open_fill_ms() const { return open_fill_ms_; }
+    uint64_t open_fill_bytes() const { return open_fill_bytes_; }
     double ms_launch() const { return ms_launch_; }
     double ms_wait() const { return ms_wait_; }
     double ms_copy() const { return ms_copy_; }
@@ -139,6 +148,7 @@ private:
         int32_t expert = 0;
         uint32_t gen = 0;
         uint64_t ctrl_seq = 0;
+        uint64_t send_time_ns = 0;
     };
 
     bool check_heartbeat_alive();
@@ -160,6 +170,9 @@ private:
     bool alive_ = false;
     bool launched_ = false;
     bool needs_resync_ = false;
+    bool use_q8_1_ = false;
+    bool use_compact_rows_ = false;
+    bool active_compact_out_ = false;
     uint32_t residency_gen_ = 0;
     uint64_t next_ctrl_seq_ = 1;
     uint64_t next_doorbell_seq_ = 0;
@@ -186,8 +199,15 @@ private:
     uint64_t promotes_acked_ = 0;
     uint64_t demotes_sent_ = 0;
     uint64_t resyncs_done_ = 0;
+    double c_move_ms_ = 0.0;
+    uint64_t move_samples_ = 0;
+    uint64_t last_promote_ack_ns_ = 0;
+    double open_fill_ms_ = 0.0;
+    uint64_t open_fill_bytes_ = 0;
     double last_round_ms_ = 0.0;
     int32_t last_round_entries_ = 0;
+    int32_t last_round_distinct_ = 0;
+    int32_t active_distinct_ = 0;
     double ms_launch_ = 0.0;
     double ms_wait_ = 0.0;
     double ms_copy_ = 0.0;

@@ -88,62 +88,112 @@ bool pread_exact(int fd, void* dst, size_t n, uint64_t off, std::string& err) {
     return true;
 }
 
-bool load_layer0_blobs(const std::string& pack_dir, const std::string& native_gguf,
-                       int32_t count, std::vector<std::vector<uint8_t>>& out_blobs,
-                       std::string& err) {
+struct ColdBlobEntry {
+    int32_t layer = 0;
+    std::vector<uint8_t> bytes;
+};
+
+// Loads a cold-DRAM working set (>= target_bytes, default 144 MiB > L3 cache)
+// spread across layers & experts so CPU microbenchmarks stream from main DRAM
+// instead of hitting L3 cache.
+bool load_cold_dram_blobs(const std::string& pack_dir, const std::string& native_gguf,
+                          int32_t n_layers, int32_t n_expert, uint64_t target_bytes,
+                          std::vector<ColdBlobEntry>& out_blobs, std::string& err) {
     const cpu::ExpertLayout& lay = cpu::expert_layout();
-    const size_t bb = size_t(lay.blob_bytes(0));
-    out_blobs.assign(size_t(count), std::vector<uint8_t>(bb));
+    out_blobs.clear();
 
     const std::filesystem::path exp_bin = std::filesystem::path(pack_dir) / "experts.bin";
     std::error_code ec;
-    if (std::filesystem::exists(exp_bin, ec) && !ec) {
-        const int fd = ::open(exp_bin.c_str(), O_RDONLY | O_CLOEXEC);
-        if (fd < 0) { err = "cannot open " + exp_bin.string(); return false; }
-        for (int32_t e = 0; e < count; ++e) {
-            if (!pread_exact(fd, out_blobs[size_t(e)].data(), bb, lay.blob_offset(0, e), err)) {
-                ::close(fd);
-                return false;
-            }
-        }
-        ::close(fd);
-        return true;
-    }
+    const bool has_experts_bin = std::filesystem::exists(exp_bin, ec) && !ec;
+    int exp_fd = -1;
+    std::vector<int> role_fds;
+    std::vector<std::string> opened_names;
+    std::vector<int> opened_fds;
 
-    if (!lay.native || native_gguf.empty()) {
-        err = "load_layer0_blobs: missing experts.bin and no --native shard";
-        return false;
-    }
-    const std::filesystem::path shard1(native_gguf);
-    const std::filesystem::path dir = shard1.parent_path();
-    const cpu::NativeFmt& fm = lay.fmt[0];
-    const uint64_t per[3] = {fm.up_off, fm.up_off, uint64_t(bb) - fm.down_off};
-    const uint64_t at[3] = {0, fm.up_off, fm.down_off};
-    int fds[3] = {-1, -1, -1};
-    for (int r = 0; r < 3; ++r) {
-        std::filesystem::path p = shard1;
-        if (size_t(r) < lay.gguf_file.size() && !lay.gguf_file[size_t(r)].empty()) {
-            p = dir.empty() ? std::filesystem::path(lay.gguf_file[size_t(r)]) : (dir / lay.gguf_file[size_t(r)]);
-        }
-        fds[r] = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
-        if (fds[r] < 0) {
-            for (int k = 0; k < r; ++k) if (fds[k] >= 0) ::close(fds[k]);
-            err = "cannot open GGUF shard " + p.string();
+    auto close_all = [&] {
+        if (exp_fd >= 0) { ::close(exp_fd); exp_fd = -1; }
+        for (int fd : opened_fds) if (fd >= 0) ::close(fd);
+        opened_fds.clear();
+    };
+
+    if (has_experts_bin) {
+        exp_fd = ::open(exp_bin.c_str(), O_RDONLY | O_CLOEXEC);
+        if (exp_fd < 0) { err = "cannot open " + exp_bin.string(); return false; }
+    } else {
+        if (!lay.native || native_gguf.empty()) {
+            err = "load_cold_dram_blobs: missing experts.bin and no --native shard";
             return false;
         }
-    }
-    bool ok = true;
-    for (int32_t e = 0; e < count && ok; ++e) {
-        for (int r = 0; r < 3 && ok; ++r) {
-            const uint64_t off = lay.gguf_off[size_t(r)] + per[r] * uint64_t(e);
-            ok = pread_exact(fds[r], out_blobs[size_t(e)].data() + at[r], size_t(per[r]), off, err);
+        const std::filesystem::path shard1(native_gguf);
+        const std::filesystem::path dir = shard1.parent_path();
+        role_fds.assign(size_t(3 * n_layers), -1);
+        for (int32_t l = 0; l < n_layers; ++l) {
+            for (int r = 0; r < 3; ++r) {
+                const size_t idx = size_t(3 * l + r);
+                std::filesystem::path p = shard1;
+                if (idx < lay.gguf_file.size() && !lay.gguf_file[idx].empty()) {
+                    p = dir.empty() ? std::filesystem::path(lay.gguf_file[idx]) : (dir / lay.gguf_file[idx]);
+                }
+                const std::string ps = p.string();
+                int fd = -1;
+                for (size_t k = 0; k < opened_names.size(); ++k) {
+                    if (opened_names[k] == ps) { fd = opened_fds[k]; break; }
+                }
+                if (fd < 0) {
+                    fd = ::open(ps.c_str(), O_RDONLY | O_CLOEXEC);
+                    if (fd < 0) {
+                        close_all();
+                        err = "cannot open GGUF shard " + ps;
+                        return false;
+                    }
+                    opened_names.push_back(ps);
+                    opened_fds.push_back(fd);
+                }
+                role_fds[idx] = fd;
+            }
         }
     }
-    for (int r = 0; r < 3; ++r) if (fds[r] >= 0) ::close(fds[r]);
-    return ok;
+
+    uint64_t total_b = 0;
+    // Cap layer span to layers with the same format as layer 0? No — cycle across
+    // all layers (each entry remembers its layer so run_split_multi_native uses the
+    // exact layer format!).
+    for (int32_t e = 0; e < n_expert && total_b < target_bytes; ++e) {
+        for (int32_t l = 0; l < n_layers && total_b < target_bytes; ++l) {
+            // Keep blobs from layers matching layer 0's (gu_type, d_type) when batching
+            // heterogeneous batches in one run_split_multi_native call.
+            if (lay.native &&
+                (lay.fmt[size_t(l)].gu_type != lay.fmt[0].gu_type ||
+                 lay.fmt[size_t(l)].d_type != lay.fmt[0].d_type)) {
+                continue;
+            }
+            const size_t bb = size_t(lay.blob_bytes(l));
+            ColdBlobEntry entry{};
+            entry.layer = l;
+            entry.bytes.resize(bb);
+            bool ok = true;
+            if (has_experts_bin) {
+                ok = pread_exact(exp_fd, entry.bytes.data(), bb, lay.blob_offset(l, e), err);
+            } else {
+                const cpu::NativeFmt& fm = lay.fmt[size_t(l)];
+                const uint64_t per[3] = {fm.up_off, fm.up_off, uint64_t(bb) - fm.down_off};
+                const uint64_t at[3] = {0, fm.up_off, fm.down_off};
+                for (int r = 0; r < 3 && ok; ++r) {
+                    const size_t idx = size_t(3 * l + r);
+                    const uint64_t off = lay.gguf_off[idx] + per[r] * uint64_t(e);
+                    ok = pread_exact(role_fds[idx], entry.bytes.data() + at[r], size_t(per[r]), off, err);
+                }
+            }
+            if (!ok) { close_all(); return false; }
+            total_b += bb;
+            out_blobs.push_back(std::move(entry));
+        }
+    }
+    close_all();
+    return !out_blobs.empty();
 }
 
-void benchmark_cpu(const std::vector<std::vector<uint8_t>>& blobs, bool native,
+void benchmark_cpu(const std::vector<ColdBlobEntry>& blobs, bool native,
                    int32_t H, int iters, int threads, pr::CpuProfile& out) {
     const cpu::CpuTopology topo = cpu::detect_cpu_topology(/*skip_first=*/true);
     out.cpu_model = cpu::cpu_name();
@@ -169,24 +219,33 @@ void benchmark_cpu(const std::vector<std::vector<uint8_t>>& blobs, bool native,
     const int batch_sizes[4] = {1, 2, 4, 8};
     out.expert_latency.clear();
 
+    // Advance cursor round-robin across the >= 128 MiB cold-DRAM working set so
+    // consecutive timed batches never reuse L3-hot weight blobs.
+    size_t cursor = 0;
     for (int n : batch_sizes) {
         std::vector<cpu::ExpertJobMulti> jobs(static_cast<size_t>(n));
-        for (int i = 0; i < n; ++i) {
-            jobs[size_t(i)].blob = blobs[size_t(i % int(blobs.size()))].data();
-            jobs[size_t(i)].nt = 1;
-            jobs[size_t(i)].act[0] = &act;
-            jobs[size_t(i)].nact[0] = native ? nact.data() : nullptr;
-            jobs[size_t(i)].out[0] = out_buf.data() + size_t(i) * size_t(H);
-            jobs[size_t(i)].fmt = nullptr;
-        }
+        auto fill_jobs = [&] {
+            for (int i = 0; i < n; ++i) {
+                const auto& blob = blobs[cursor % blobs.size()];
+                ++cursor;
+                jobs[size_t(i)].blob = blob.bytes.data();
+                jobs[size_t(i)].nt = 1;
+                jobs[size_t(i)].act[0] = &act;
+                jobs[size_t(i)].nact[0] = native ? nact.data() : nullptr;
+                jobs[size_t(i)].out[0] = out_buf.data() + size_t(i) * size_t(H);
+                jobs[size_t(i)].fmt = nullptr;
+            }
+        };
         // Warmup
         for (int w = 0; w < 3; ++w) {
+            fill_jobs();
             if (native) pool.run_split_multi_native(lay.fmt[0], jobs.data(), n);
             else pool.run_split_multi(jobs.data(), n);
         }
         std::vector<double> samples;
         samples.reserve(size_t(iters));
         for (int it = 0; it < iters; ++it) {
+            fill_jobs();
             const uint64_t t0 = fi::now_ns();
             if (native) pool.run_split_multi_native(lay.fmt[0], jobs.data(), n);
             else pool.run_split_multi(jobs.data(), n);
@@ -202,6 +261,7 @@ bool benchmark_agent(const std::string& raw_spec,
                      const fw::Geometry& geom,
                      const std::vector<uint64_t>& blob_bytes,
                      uint64_t avg_blob_bytes,
+                     bool allow_q8_1,
                      int iters,
                      uint32_t hello_timeout_ms,
                      pr::GpuProfile& out,
@@ -209,9 +269,8 @@ bool benchmark_agent(const std::string& raw_spec,
     fp::AgentSpec spec{};
     if (!fp::parse_agent_spec(raw_spec, spec, err)) return false;
 
-    // For profiling we only need 16 experts from layer 0 resident on the agent
-    // (fast fill!), while recording the agent's full advertised slot_count!
-    constexpr uint32_t kBenchExperts = 16;
+    // Load 64 experts (~128 MiB) so OPEN fill also gives a realistic H2D bandwidth estimate.
+    constexpr uint32_t kBenchExperts = 64;
     std::vector<std::pair<int32_t, int32_t>> bench_ranked;
     for (uint32_t e = 0; e < kBenchExperts && int32_t(e) < geom.n_expert; ++e) {
         bench_ranked.emplace_back(0, int32_t(e));
@@ -237,6 +296,9 @@ bool benchmark_agent(const std::string& raw_spec,
     out.recommended_slots = adv_slots;
     out.vram_usable_bytes = uint64_t(adv_slots) * avg_blob_bytes;
     out.vram_total_bytes = out.vram_usable_bytes;
+    if (tier.open_fill_ms() > 0.0 && tier.open_fill_bytes() > 0) {
+        out.pcie_h2d_gbps = double(tier.open_fill_bytes()) / (tier.open_fill_ms() * 1e6);
+    }
 
     std::mt19937 rng(19);
     std::normal_distribution<float> nd(0.0f, 0.5f);
@@ -249,7 +311,6 @@ bool benchmark_agent(const std::string& raw_spec,
     std::vector<int32_t> salvaged;
 
     for (int n : batch_sizes) {
-        // Fit n distinct experts into (n_tok, k) within agent caps (k = geom.k, e.g. 10 -> n=16 uses n_tok=2).
         const int64_t k_use = geom.k;
         const int64_t n_tok = (n + k_use - 1) / k_use;
         if (!tier.can_dispatch(n_tok, k_use)) continue;
@@ -265,7 +326,7 @@ bool benchmark_agent(const std::string& raw_spec,
         // Warmup
         for (int w = 0; w < 5; ++w) {
             salvaged.clear();
-            if (tier.launch(0, x.data(), ids.data(), n_tok, k_use, kind.data())) {
+            if (tier.launch(0, x.data(), ids.data(), n_tok, k_use, kind.data(), allow_q8_1)) {
                 (void)tier.finish(out_rows.data(), salvaged);
             }
         }
@@ -274,7 +335,7 @@ bool benchmark_agent(const std::string& raw_spec,
         for (int it = 0; it < iters; ++it) {
             salvaged.clear();
             const uint64_t t0 = fi::now_ns();
-            if (!tier.launch(0, x.data(), ids.data(), n_tok, k_use, kind.data()) ||
+            if (!tier.launch(0, x.data(), ids.data(), n_tok, k_use, kind.data(), allow_q8_1) ||
                 !tier.finish(out_rows.data(), salvaged)) {
                 err = "agent benchmark round salvaged/failed at n=" + std::to_string(n);
                 tier.close();
@@ -350,9 +411,11 @@ int main(int argc, char** argv) {
 
     std::string err;
     bool native = false;
+    bool layer0_no_had_gu = false;
     std::vector<uint64_t> blob_bytes(static_cast<size_t>(n_layers), static_cast<uint64_t>(cpu::BLOB));
     fw::PackIdentity pack_id{};
-    std::vector<std::vector<uint8_t>> cpu_blobs;
+    std::vector<ColdBlobEntry> cpu_blobs;
+    constexpr uint64_t kColdDramBytes = 144ull << 20;  // >= 128 MiB working set to exceed L3 cache
 
     if (!pack_dir.empty()) {
         if (!cpu::expert_layout_load(pack_dir, n_layers, n_expert, err)) {
@@ -361,12 +424,14 @@ int main(int argc, char** argv) {
         }
         const cpu::ExpertLayout& lay = cpu::expert_layout();
         native = lay.native;
+        layer0_no_had_gu = native && !lay.fmt.empty() && !lay.fmt[0].had_gu;
         for (int32_t l = 0; l < n_layers; ++l) blob_bytes[size_t(l)] = lay.blob_bytes(l);
         if (!fi::compute_pack_identity(pack_dir, native_gguf, lay, pack_id, err)) {
             std::fprintf(stderr, "franken-profile: %s\n", err.c_str());
             return 1;
         }
-        if (!load_layer0_blobs(pack_dir, native_gguf, 8, cpu_blobs, err)) {
+        if (!load_cold_dram_blobs(pack_dir, native_gguf, n_layers, n_expert,
+                                  kColdDramBytes, cpu_blobs, err)) {
             std::fprintf(stderr, "franken-profile: %s\n", err.c_str());
             return 1;
         }
@@ -376,9 +441,12 @@ int main(int argc, char** argv) {
             return 2;
         }
         std::mt19937 rng(123);
-        cpu_blobs.assign(8, std::vector<uint8_t>(cpu::BLOB, 0));
-        for (auto& b : cpu_blobs) {
-            for (size_t i = 0; i < b.size(); i += 17) b[i] = uint8_t(rng() & 0xffu);
+        const size_t n_syn = size_t((kColdDramBytes + cpu::BLOB - 1) / cpu::BLOB);
+        cpu_blobs.resize(n_syn);
+        for (auto& entry : cpu_blobs) {
+            entry.layer = 0;
+            entry.bytes.assign(cpu::BLOB, 0);
+            for (size_t i = 0; i < entry.bytes.size(); i += 17) entry.bytes[i] = uint8_t(rng() & 0xffu);
         }
     }
 
@@ -386,8 +454,11 @@ int main(int argc, char** argv) {
     for (uint64_t b : blob_bytes) sum_blob += b;
     prof.avg_blob_bytes = sum_blob / uint64_t(std::max<int32_t>(1, n_layers));
 
-    std::printf("franken-profile: benchmarking host CPU (%s, %d iters/batch)...\n",
-                native ? "native IQ" : "canonical s2", iters);
+    uint64_t cold_ws_bytes = 0;
+    for (const auto& cb : cpu_blobs) cold_ws_bytes += cb.bytes.size();
+    std::printf("franken-profile: benchmarking host CPU (%s, %zu cold blobs = %.1f MiB > L3, %d iters/batch)...\n",
+                native ? "native IQ" : "canonical s2", cpu_blobs.size(),
+                double(cold_ws_bytes) / 1048576.0, iters);
     benchmark_cpu(cpu_blobs, native, n_embd, iters, cpu_threads, prof.cpu);
 
     if (!primary_vendor.empty()) {
@@ -418,7 +489,7 @@ int main(int argc, char** argv) {
     for (const std::string& spec : agent_specs) {
         std::printf("franken-profile: probing agent '%s' over /dev/shm...\n", spec.c_str());
         pr::GpuProfile gp{};
-        if (!benchmark_agent(spec, geom, blob_bytes, prof.avg_blob_bytes, iters,
+        if (!benchmark_agent(spec, geom, blob_bytes, prof.avg_blob_bytes, layer0_no_had_gu, iters,
                              hello_timeout_ms, gp, err)) {
             std::fprintf(stderr, "franken-profile: agent probe failed: %s\n", err.c_str());
             return 1;

@@ -293,5 +293,13 @@ void fnv1a_u64(uint64_t& h, uint64_t v);
 
 bool pack_identity_matches(const wire::PackIdentity& a, const wire::PackIdentity& b);
 
+// ---------------------------------------------------------------------------
+// Phase 3 canonical q8_1 wire activation quantizer (matches q8_1_store bit-for-bit)
+// ---------------------------------------------------------------------------
+
+// Quantizes `n_rows` rows of `n_cols` floats (n_cols a multiple of 32) into
+// `n_rows * (n_cols / 32) * 36` bytes of ggml block_q8_1 ({fp16 d, fp16 s, int8 qs[32]}).
+void quantize_q8_1_rows_host(const float* x, int32_t n_rows, int32_t n_cols, uint8_t* dst);
+
 }  // namespace ipc
 }  // namespace franken
